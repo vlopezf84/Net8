@@ -1,0 +1,444 @@
+Calypso Liquidacion Recommendations
+Calypso_Liquidacion - Architecture & Code Quality Recommendations
+Solution: Calypso_Liquidacion.slnx (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion.slnx). Reviewed: 2026-10-22, branch develop, commit 943f48e152d84cd80ca3ec5c9255f4d1a6c6c9ca (2026-10-05), clean working tree. Compared against: LoansApp coding-practices baseline (../BaseLine_Docs/LoansApp_Architecture_Patterns_and_Coding_Practices.md) and PR review/severity checklist (../BaseLine_Docs/code_review.md). See also: orchestration/control (./_ORCHESTRATION.md) (methodology, template, standing findings), application understanding (master) (../Application_understanding_technical_document_master.md) (section 4.1.4) and the two stored procedures this service calls, usp_CLiquidacion_GetSolicitudesLiquidacion (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_Liquidacion/IT24/Procedures/001%20SP%20usp_CLiquidacion_GetSolicitudesLiquidacion.sql) and usp_CLiquidacion_InsLiquidacionCompleto (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_Liquidacion/IT24/Procedures/002%20SP%20usp_CLiquidacion_InsLiquidacionCompleto.sql). Target: .NET Framework 4.8 Windows Service (x86) plus two T-SQL procedures; focus: all categories; severity threshold: all. Audit only: no application fixes applied.
+1. Solution Overview (low/no-dependency -> high dependency)
+Tier	Project	Kind	Path
+0	Aplicacion_C_Liquidacion	Class library (orchestration, the seven message patterns, validation, XML builder, interfaces, DTOs)	Aplicacion_C_Liquidacion.csproj (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Aplicacion_C_Liquidacion.csproj)
+1	Infraestructura_C_Liquidacion	Class library (TOMI and T24 repositories, alert/log adapter, DataTable mapper)	Infraestructura_C_Liquidacion.csproj (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Infraestructura_C_Liquidacion.csproj)
+2	Calypso_Liquidacion	Windows Service executable (composition root, WindowsServiceHostBase)	Calypso_Liquidacion.csproj (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/Calypso_Liquidacion.csproj)
+2	PruebasUnitarias	MSTest library (9 test methods; SDK-style, net48)	PruebasUnitarias.csproj (../../CALYPSO/Calypso_Liquidacion/PruebasUnitarias/PruebasUnitarias.csproj)
+-	Database layer (outside this repository)	2 T-SQL procedures in InterfacesT24 (TOMI)	IT24/Procedures (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_Liquidacion/IT24/Procedures)
+
+What this solution actually does: it is the inbound parser/validator for the liquidation instructions that Calypso writes into the TOMI interchange table. On every timer tick it marks the start of the tick in TOMI, reads the TOMI system date and two parameters (HORA_OP_INICIO, HORA_OP_CEP_FIN), refuses to run on a non-business day (raising an alert) or outside the operating window, and then asks usp_CLiquidacion_GetSolicitudesLiquidacion for every row of tbl_calypso_intercambio with estatus = 'RECV' and tipo = 'LIQ' (id_envio, msg_out). Each message is matched, in fixed order, against seven regular expressions: three CSV layouts (T24, SPEI, SPID) and four SWIFT FIN texts (MT103, MT202, MT210, MT300); the first match wins and its named groups become a LiquidacionModel. Validation then normalises the amount, derives the direction (E for receive, S for pay, always S for the four SWIFT types), and checks T24: for T24 the account must exist in the T24 view, its currency must equal the message currency and its customer must equal the CDL; for SPEI/SPID and the SWIFT types only the CDL customer must exist; MT300 is accepted without any lookup. The result is turned into a <row> XML and persisted by usp_CLiquidacion_InsLiquidacionCompleto, one transaction that inserts the liquidation row (tipo_operacion = MD_<type>[_<E|S>], or MD_UNKNOW when invalid), creates or completes the Entrada/Salida pair in tbl_calypso_liquidacion_par for SPEI/SPID/T24/MT103/MT202, and flips the interchange row to PROC. Rejected messages are persisted too (operacion_valida = 0, razon_rechazo), so every request leaves an audit row. The service neither moves money nor talks to Calypso; whoever consumes tbl_calypso_liquidacion (status INI) is not in this repository.
+1.1 Issue Summary
+Recommended priority	Count	Simple meaning
+Blocker	1	Close before approving a release: the build is not reproducible (D:\ServiceCMS\MUFG_T24.dll)
+Major	13	Correct or explicitly accept before relying on the service: a service stop mid-batch can permanently reject a valid instruction, invisible SQL failures, a poison message that loops forever, a regular expression that can freeze a tick, amounts silently stored as NULL, a redelivered instruction stored twice, a wrongly named service identity, a suite that proves almost nothing
+Minor	14	Maintainability, diagnosability and cleanup after correctness work
+Total distinct findings	28	One category per finding; no duplicate tickets
+
+Skill category	Count
+MustChange/rewrite	13
+rewrite_recommended	12
+NiceToRewrite_ifTimePermits	3
+
+Priorities are source-review release recommendations, not CVSS or proof of a production incident. Items marked *verify* depend on facts not present in the repository (the real Calypso message feed, the deployed MUFG_T24.dll, table DDL, the encrypted service configuration that holds the timer interval). No SQL injection (every procedure call is parameterised), cleartext credential logging, weak cryptography primitive, throw ex;, sync-over-async, FirstOrDefault() dereference or hard-coded secret was found (see 2.2).
+2. Scope & Methodology Note
+Area	Evidence / limitation
+Source scope	44/44 tracked files, 2,801/2,801 physical lines read, not sampled: 34 C# files (1,923 lines: Aplicacion 23 / 1,025, Infraestructura 5 / 301, host 4 / 264, tests 2 / 333), four .csproj, Calypso_Liquidacion.slnx, App.config, packages.config, README.md (93, unmodified GitLab template), .gitignore (363) and .gitattributes (63) (both standard Visual Studio / * text=auto content; searched for secret, key and appsettings rules)
+Not tracked	PruebasUnitarias\obj\ (14 restore/build files, git-ignored by rule [Oo]bj/) and an empty folder Infraestructura\Properties\ (leftover of the duplicate project reported by GEN-3; the duplicate .csproj no longer exists)
+Context also read	The two T-SQL procedures (438 lines); shared MUFG_T24 source in General\MUFGT24_BTMUM_64 only to confirm or rule out local findings: RepositorioMaestro.EjecutarStoredProcedureQuery / ValidarResultadoStoredProcedure / FinalizarResultadoStoredProcedure, StoredProcedureResult, Parametrizacion.ObtenerParametrosSistemaAsync, IParametrizacion, IControlServicio, Configuracion, T24MwVistas, CuentaClienteT24, Config, WindowsServiceHostBase. Shared-library defects are out of scope
+Review basis	Full current-source audit, not a changed-lines PR verdict
+Executed probes	The seven regular expressions were extracted from ConstantesServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Enums/ConstantesServicio.cs) and run with .NET Framework 4.8 (the service runtime) against hand-built messages to measure backtracking and anchoring (CL-FR-3, CL-FR-8, CL-FR-13, CL-FR-14). The sample messages are illustrative, not production data
+Build	Not built. D:\ServiceCMS does not exist on this machine, so MUFG_T24.dll is unavailable; neither dotnet nor msbuild is on PATH
+Tests	9 real MSTest methods; reviewed, not executed; no coverage measured. Findings about what they exercise (CL-FR-25) are derived by reading the set-ups against the IParametrizacion/IControlServicio source on disk and the production call sites
+Not available	Deployed MUFG_T24.dll, the real msg_out samples and volumes, the encrypted ConfiguracionEncriptadaHelper service settings (timer interval, log path), table DDL/indexes of tbl_calypso_*, the consumer of tbl_calypso_liquidacion, SLAs
+Stale metadata	The Phase 0 master document lists an appsettings.json for this solution that does not exist (the two .json files are NuGet restore output under PruebasUnitarias\obj); the service reads its configuration through ConfiguracionEncriptadaHelper
+Fix examples	Illustrative contracts, not compiled patches
+
+2.1 Full-read batches (single session, 2026-10-22)
+Batch	Contents	Files	Physical lines	Status
+A	Aplicacion: OperacionServicio, ValidadorEjecucion, ConstantesServicio (seven patterns), VariablesProcessor, TipoLiquidacionExtensions, 5 interfaces, 5 DTOs, 4 models, 2 enums, 2 AssemblyInfo, csproj	24	1,120	Full read complete
+B	Infraestructura: OperacionesTomiDao, OperacionesT24Dao, AppLogger, DataContextHelpers, AssemblyInfo, csproj	6	380	Full read complete
+C	Host: Program, ServiceHost, ServiceHost.Designer, AssemblyInfo, App.config, packages.config, csproj	7	397	Full read complete
+D	Tests: OperacionServicioUT, MSTestSettings, csproj	3	367	Full read complete
+E	Solution and repository files: .slnx, README.md, .gitignore, .gitattributes	4	537	Full read complete
+	Total	44	2,801	
+
+2.2 Quantified cross-checks (supplement to the full read)
+Scan (non-obj *.cs)	Count	Meaning
+throw ex; / .Result / .Wait() / GetAwaiter().GetResult()	0 / 0 / 0 / 0	None found
+catch (Exception / throw;	13 / 5	Every catch (Exception outside the repositories swallows (CL-FR-1, CL-FR-2, CL-FR-7)
+_appLogger.Log( / LogAsync( / ManejarErrorAsync(	14 / 5 / 8	Calls through IAppLogger lose [CallerMemberName] (CL-FR-19)
+Config.EscribirLog / obsolete Logging.*	8 / 2	Both classes are [Obsolete] in MUFG_T24 (CL-FR-24)
+.Value dereferences / FirstOrDefault	9 / 1	Only Pid.Value (CL-FR-18) is unguarded; EsDiaHabil.Value follows a bool assignment; FirstOrDefault is null-tolerated (PersistirOperacionAsync)
+new Regex( with a match timeout	0 of 7	CL-FR-3
+DateTime.Now / UtcNow	0	The clock comes from TOMI (ObtenerHoraSistema)
+Cryptography (MD5, SHA1, DES), credential literals	0	No code_review.md section 9 hit (the 18 case-insensitive token matches are CancellationToken)
+[TestMethod] / assertions / Verify(	9 / 3 Should() / 11	CL-FR-25, CL-FR-26
+Named regex group occurrences / keys mapped by MapearValor	66 / 11	CL-FR-13
+
+3. What's Already Good
+• Clean layering and explicit seams. Aplicacion_C_Liquidacion has no project reference to infrastructure; every collaborator has an interface (IOperacionesTomi, IOperacionesT24, IValidadorEjecucion, IAppLogger, IOperacionServicio) and OperacionServicio takes all of them by constructor (OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):28-38). Business rules (validation, XML) are separate from I/O, which is what makes the fixes below cheap.
+• Container verified at start-up and per-tick scope. ServiceHost.cs (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/ServiceHost.cs):97 calls _containerDI.Verify(), and each tick runs inside AsyncScopedLifestyle.BeginScope (:131) with a cloned Configuracion (:88), so the per-tick state (FechaSistema, EsDiaHabil) never leaks between ticks.
+• No SQL built from text. Both repositories call stored procedures with typed parameters (OperacionesTomiDao.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Repositorios/OperacionesTomiDao.cs):53-69); the T24 reads go through the shared view adapter with a single parameter. No injection surface.
+• Required parameters are validated by the shared library. ObtenerParametrosSistemaAsync(string) treats every listed key as required and throws when missing or empty (Parametrizacion.cs:239-248, 275), so the dictionary lookups at OperacionServicio.cs:88-89 cannot raise KeyNotFoundException after a successful call.
+• The write is atomic and auditable. usp_CLiquidacion_InsLiquidacionCompleto runs SET XACT_ABORT ON, a single transaction, writes the liquidation, the pair and the PROC status together, logs to Auditoria.ErrorLog and re-throws. Rejected messages are stored with their reason, so no instruction silently disappears from the interchange table.
+• XML is built with `XmlDocument`/`CreateTextNode` (VariablesProcessor.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Helpers/VariablesProcessor.cs):31-86), so values are escaped; no string concatenation of XML.
+• Cancellation is honoured between requests (OperacionServicio.cs:122) and the host shuts down through the shared base with a cleanup token (ServiceHost.cs:144-185).
+• Regexes are compiled once into a static dictionary with named groups, so adding a message type is data, not a new branch.
+• Real unit-test project. MSTest + Moq, method-level parallelism, Arrange/Act/Assert layout, descriptive Spanish names; the seams above make the orchestration mockable.
+• Hygiene: no Console/Debug output, no DateTime.Now, no hard-coded connection strings or credentials, build output git-ignored.
+4. Findings by Project (low/no-dependency -> high dependency)
+Finding IDs use the prefix CL-FR- (Calypso_Liquidacion - full review). Paths are relative to CALYPSO\Calypso_Liquidacion\.
+4.1 Aplicacion_C_Liquidacion (Tier 0)
+MustChange / Rewrite
+CL-FR-1 - A service stop can turn a valid instruction into a permanent rejection (Major) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):120-125, 238-243, 335-340 and 162-175.
+Code block (csharp)
+foreach (var solicitud in solicitudes)
+{
+    if (ct.IsCancellationRequested) break;
+    await ProcesarSolicitudAsync(solicitud, ct);          // interpret (regex) -> ValidaOperacion
+}
+...
+private async Task<ResultadoOperacionModel> ValidaOperacion(LiquidacionModel liquidacionModel, CancellationToken ct)
+{
+    try
+    {
+        ct.ThrowIfCancellationRequested();                // :242
+        ...
+    }
+    catch (Exception ex)                                  // :335 also catches OperationCanceledException
+    {
+        _appLogger.Log(TipoLog.ERROR, $"valida_operacion|Error: {ex}");
+        return ResultadoOperacionModel.Fallo(ex.ToString());
+    }
+}
+Issue: the loop checks the token at :122, then the message is parsed with a regex and ValidaOperacion checks it again at :242. If the service is stopped in that window the OperationCanceledException is swallowed by catch (Exception) and converted into Fallo(ex.ToString()). ProcesarSolicitudAsync (:162-175) then persists it as operacion_valida = 0 with the exception text as the reason, and usp_CLiquidacion_InsLiquidacionCompleto flips the interchange row to PROC. A valid liquidation is permanently rejected and will not be retried. The window is milliseconds wide for a normal message, but it is wider for slow messages (CL-FR-3), it opens on every deployment/stop, and the consequence is a lost payment instruction. The second ThrowIfCancellationRequested adds nothing the loop does not already do.
+Fix:
+Code block (csharp)
+// ValidaOperacion: do not throw on cancellation, and never translate it into a business result
+catch (OperationCanceledException) { throw; }
+catch (Exception ex) { ... }
+ 
+// ProcesarSolicitudAsync: leave the request in RECV when cancelled
+catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+Benefit: a stop leaves unfinished requests untouched (still RECV) so the next start processes them; no business state is derived from shutdown. Suggested JIRA: CL-1 (Major)
+CL-FR-2 - A request that cannot be stored is retried on every tick, forever (poison message) (Major) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):345-391, OperacionesTomiDao.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Repositorios/OperacionesTomiDao.cs):45-83, 001 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_Liquidacion/IT24/Procedures/001%20SP%20usp_CLiquidacion_GetSolicitudesLiquidacion.sql):57-62, 002 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_Liquidacion/IT24/Procedures/002%20SP%20usp_CLiquidacion_InsLiquidacionCompleto.sql):91, 195, 215, 331.
+Code block (csharp)
+var resultado = await _operacionesTomi.InsertarLiquidacionAsync(dto);
+if (resultado == null)
+{
+    await _appLogger.LogAsync(TipoLog.ERROR, "No fue posible persistir la liquidación.", generarAlerta: true);
+    return;                                              // :382  nothing records that this id_envio failed
+}
+...
+catch (Exception ex)
+{
+    await _appLogger.ManejarErrorAsync(ex, $"Error el insertar la liquidación: {ex}");   // :388  swallowed
+}
+Issue: PersistirOperacionAsync returns void and swallows every failure. The only thing that moves a row out of the work list is the UPDATE ... SET estatus = 'PROC' at the end of the stored procedure, which rolls back with the insert. If the insert fails for a data reason (for example @nom_cliente VARCHAR(150) receiving a longer COMPANY_NAME, CAST(@fecha_sistema AS INT), or a reason text longer than the err_descripcion column, see CL-FR-5), the row stays RECV, is selected again 5-10 seconds later, is parsed, queried in T24 and rejected by the database again, and raises one alert row per tick for as long as it exists. There is no attempt counter, no quarantine status and no de-duplication of the alert. The catch inside ProcesarSolicitudAsync (:178-182) tries a second insert with ERROR: ..., which fails for the same reason. Because the shared SQL runner hides the database error (CL-FR-17), the log does not even say why.
+Fix: make the persistence outcome explicit and bound the retries:
+Code block (csharp)
+private async Task<bool> PersistirOperacionAsync(...)      // returns false instead of swallowing
+...
+if (!await PersistirOperacionAsync(...)) RegistrarFallo(model.IdEnvio);   // in-memory attempts per id_envio
+ 
+private void RegistrarFallo(string idEnvio)
+{
+    var intentos = _intentos.AddOrUpdate(idEnvio, 1, (_, n) => n + 1);
+    if (intentos == MaxIntentos)                                        // quarantine once, alert once
+        _ = _operacionesTomi.MarcarErrorAsync(idEnvio, "NO_PERSISTIBLE"); // new SP: estatus = 'ERR'
+}
+Benefit: a single bad row cannot generate an unbounded stream of work and alerts; operators see one alert per quarantined id with the real cause. Suggested JIRA: CL-2 (Major)
+CL-FR-3 - The `MT300` regular expression can run for minutes on a malformed message and no pattern has a time limit (Major, *verify* frequency against real data) File: ConstantesServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Enums/ConstantesServicio.cs):21-31, 59-60; OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):197-200.
+Code block (csharp)
+{ "MT300", new Regex(Patron_LIQ_MT300, RegexOptions.IgnoreCase | RegexOptions.Compiled) }   // no matchTimeout
+...
+@"...\{4:\r?\n?([0-9A-Za-z \'\(\)\{\}\+\,\-\.\/\:\?\r\n]*):20:(?<trade_id>[0-9]{1,20})\r?\n?([...]*):30T:(?<value_date>...)
+ \r?\n?([...]*):32B:(?<moneda>[A-Z]{3})(?<monto>[0-9\,]{0,15})\r?\n?([...]*)-\}(\{5:})?)$"
+Issue: MT300 is evaluated last for every message that matched nothing else. Its filler groups are unbounded * over a class that includes `:` and line breaks, so each :20:/:30T:/:32B: marker can be found in many places and the engine tries every combination when the tail does not match. Executed on .NET Framework 4.8 (the service runtime) with a message that has a valid MT300 header, repeated :20:/:30T:/:32B:/:33B: blocks and no -} terminator:
+Repeated blocks	Message length	Result
+1	123 chars	no match, 1 ms
+5	335 chars	no match, 296 ms
+10	600 chars	no match, 1,895 ms
+20 / 30 / 40	1.1 / 1.7 / 2.2 KB	no result after 20 s (probe timeout)
+
+A well-formed MT300 matched in 0-12 ms and a well-formed message with a trailing CRLF failed fast (13-20 ms), so the blow-up needs repeated field markers plus a missing or damaged tail: unlikely for a clean feed, but one such message holds the tick for hours, the shared WindowsServiceHostBase tick lock blocks every later tick, and a service stop waits on it. The other six patterns have bounded groups and did not blow up in the same probe (1.6 KB of junk after a valid MT202/MT210 header failed in 0 ms).
+Fix: (1) give every pattern a match timeout and treat a timeout as a rejection; (2) replace the four monolithic SWIFT patterns with a tag parser, which also makes CL-FR-8/13 testable.
+Code block (csharp)
+new Regex(Patron_LIQ_MT300, RegexOptions.IgnoreCase | RegexOptions.Compiled, TimeSpan.FromSeconds(2))
+ 
+try { match = kvp.Value.Match(mensaje); }
+catch (RegexMatchTimeoutException)
+{
+    return ResultadoOperacionModel.Fallo("Mensaje no analizable (tiempo de análisis agotado)");
+}
+ 
+// tag-based alternative for block 4 (linear time)
+var tags = Regex.Matches(bloque4, @"^:(?<tag>\d{2}[A-Z]?):(?<valor>[^\r\n]*(?:\r?\n(?!:|-\}).*)*)",
+                         RegexOptions.Multiline, TimeSpan.FromSeconds(2));
+Benefit: worst-case parse time is bounded; a malformed message becomes one rejected row instead of an outage. Suggested JIRA: CL-3 (Major)
+CL-FR-4 - Amounts are normalised as strings, in two places, and an invalid amount is stored as NULL on a row marked valid (Major) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):254-265; 002 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_Liquidacion/IT24/Procedures/002%20SP%20usp_CLiquidacion_InsLiquidacionCompleto.sql):124-131.
+Code block (csharp)
+if (tipoLiquidacionEnum == MT103 || ... MT202 || ... MT300 || ... MT210)
+    liquidacionModel.Monto = liquidacionModel.Monto.Replace(",", ".");     // SWIFT: comma is the decimal mark
+else
+    liquidacionModel.Monto = liquidacionModel.Monto.Replace(",", "");      // CSV: comma is a thousands mark
+Code block (sql)
+SET @monto_decimal = TRY_CAST(@monto AS MONEY);     -- 002 SP:131 invalid text becomes NULL, insert still succeeds
+Issue: the patterns accept far more than a number: CSV [0-9,.]{1,25} matches ., ,, 1,2,3 and 1.234,56; SWIFT [0-9\,]{0,15} matches 1,000,50 and the empty string. After the string Replace calls, 1.234,56 becomes 1.23456 (a 1,000x error stored without complaint), 1,000,50 becomes 1.000.50, which TRY_CAST turns into NULL, and the row is still inserted with operacion_valida = 1 and its pair record. The same normalisation is repeated inside the stored procedure (two implementations of one rule), the amount travels as string through the model and DTO, and a zero amount is accepted. (The empty-amount case also raises a NullReferenceException, see CL-FR-6.)
+Fix: parse once, in the application, with an explicit format per message family; reject anything else with a business reason; pass the invariant text (or a decimal parameter) to the procedure and let the procedure THROW when the cast fails.
+Code block (csharp)
+private static bool TryNormalizarMonto(string bruto, bool esSwift, out decimal monto)
+{
+    monto = 0m;
+    if (string.IsNullOrWhiteSpace(bruto)) return false;
+    var texto = esSwift ? bruto.Replace(',', '.') : bruto.Replace(",", "");
+    return decimal.TryParse(texto, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out monto)
+           && monto > 0m;
+}
+...
+if (!TryNormalizarMonto(m.Monto, esSwift, out var monto)) return ResultadoOperacionModel.Fallo("Monto inválido");
+m.Monto = monto.ToString("0.####", CultureInfo.InvariantCulture);
+Code block (sql)
+IF @monto_decimal IS NULL THROW 50001, 'Monto inválido', 1;   -- belt and braces
+Benefit: no silently wrong or NULL amount reaches tbl_calypso_liquidacion / the pair table; one normalisation rule instead of two. Standing finding GEN-12. Suggested JIRA: CL-4 (Major)
+CL-FR-5 - Exception text and stack traces are stored as the business "rejection reason" and in alerts (Major) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):178-182, 226-230, 336-340, 388.
+Code block (csharp)
+return ResultadoOperacionModel.Fallo(ex.ToString());                                   // :229, :339
+await PersistirOperacionAsync(model, mensaje, "<row />", $"ERROR: {ex.Message}");      // :181
+await _appLogger.ManejarErrorAsync(ex, $"Error el insertar la liquidación: {ex}");     // :388
+Issue: ex.ToString() includes the full stack trace, assembly paths and any SQL/driver message, and it becomes razon_rechazo, which the procedure writes to tbl_calypso_liquidacion.err_descripcion and which operations and downstream readers treat as a business reason. The same trace is duplicated into the alert Descipcion (:388 passes {ex} as the description *and* as the exception argument). The reason text is unbounded, so a long trace can also exceed the target column and make the insert fail (CL-FR-2, *verify* the column length).
+Fix: persist a short, stable reason code and log the exception once:
+Code block (csharp)
+catch (Exception ex)
+{
+    _appLogger.Log(TipoLog.ERROR, $"valida_operacion|{model.IdEnvio}|{ex}");
+    return ResultadoOperacionModel.Fallo("ERROR_INTERNO_VALIDACION");
+}
+...
+await _appLogger.ManejarErrorAsync(ex, "Error al insertar la liquidación");            // ex is passed once
+Benefit: business tables carry readable reasons; internals are not exposed; alerts and logs stop duplicating traces. Suggested JIRA: CL-5 (Major)
+CL-FR-6 - `ValidaOperacion` dereferences a null amount and tests for a missing type after it has already thrown (Minor) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):244-266, 329.
+Code block (csharp)
+var tipoLiquidacionEnum = tipoLiquidacion.ToEnum();        // :245 throws "Tipo mensaje no soportado" for null/unknown
+if (string.IsNullOrEmpty(tipoLiquidacion))                 // :247 can never be reached with null
+    return ResultadoOperacionModel.Fallo("No se pudo identificar el tipo de liquidación");
+...
+liquidacionModel.Monto = liquidacionModel.Monto.Replace(",", ".");     // :257/:264 NRE when the amount group was empty
+...
+liquidacionModel.NombreCliente = cliente2?.COMPANY_NAME;               // :329 cliente2 was checked for null at :325
+Issue: VariablesProcessor.MapearValor is skipped for empty captures (OperacionServicio.cs:209-216), so an MT103/MT300 with an empty amount (the pattern allows {0,15}; executed probe: :32A:260101USD matched with no monto) leaves Monto == null; the Replace throws, and the outer catch persists a stack trace (CL-FR-5). The guard on :247 is dead code because ToEnum() throws first. Neither case is a design decision.
+Fix: guard first and use Enum.TryParse; reject an empty amount through TryNormalizarMonto (CL-FR-4):
+Code block (csharp)
+if (!Enum.TryParse(liquidacionModel.TipoLiquidacion, out TipoLiquidacion tipo))
+    return ResultadoOperacionModel.Fallo("No se pudo identificar el tipo de liquidación");
+Benefit: deterministic reasons for malformed messages; removes dead code and the accidental NRE path. Suggested JIRA: CL-6 (Minor)
+CL-FR-7 - The tick reports success after a failed read, and the "running" marker is never cleared on skip or failure (Major) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):45-71, 108-132.
+Code block (csharp)
+await _controlServicio.ActualizaEJecucion(_configuracion.NombreServicio);        // :47  start marker
+...
+else { _appLogger.Log(WARNING, $"Ejecución detenida: ..."); return false; }      // :55-58  no end marker
+await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio);      // :61  only after the happy path
+return true;
+...
+catch (Exception ex) { await _appLogger.ManejarErrorAsync(ex, "Error en ejecución"); return false; }   // :65-69  no end marker
+ 
+// RealizaOperaciones
+catch (Exception ex) { await _appLogger.ManejarErrorAsync(ex, "Error al Realizar operaciones"); }       // :128-131  swallowed
+Issue: two opposite defects. (a) Every out-of-window or non-business-day tick (the normal state for most of the day) and every exception leaves the execution state marked as running (GEN-7). (b) RealizaOperaciones swallows its own exception, so when the request list cannot be read the caller still executes ActualizaTerminacion and returns true: the tick is recorded as successful although nothing was processed. The result is also ignored by the host (ServiceHost.cs:133-134).
+Fix: let RealizaOperaciones throw, and finalise in one finally that records the outcome:
+Code block (csharp)
+var estado = EstadoTick.Fallido;
+try
+{
+    await _controlServicio.ActualizaEJecucion(nombre);
+    ...
+    if (!decision.Ejecutar) { estado = EstadoTick.Omitido; return false; }
+    await RealizaOperaciones(ct);
+    estado = EstadoTick.Exitoso;
+    return true;
+}
+catch (OperationCanceledException) when (ct.IsCancellationRequested) { estado = EstadoTick.Cancelado; throw; }
+catch (Exception ex) { await _appLogger.ManejarErrorAsync(ex, "Error en ejecución"); return false; }
+finally { await FinalizarTickAsync(estado); }        // guarded: never replaces the primary exception
+Benefit: monitoring reflects what happened; a failed read is no longer reported as success. Suggested JIRA: CL-7 (Major)
+Rewrite Recommended
+CL-FR-8 - Pattern anchoring is inconsistent: CSV patterns ignore extra rows and trailing text, SWIFT patterns reject a trailing line break (Major, *verify* against the real feed) File: ConstantesServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Enums/ConstantesServicio.cs):35-60.
+Issue (executed probes, .NET Framework 4.8):
+Message	Pattern	Result				
+CSV header + two data rows	T24	match; second row silently ignored (no $/\z)				
+CSV header + one row + THIS IS EXTRA TEXT	T24	match; trailing text ignored				
+Well-formed MT103 + \r\n after -}	MT103	no match -> "Mensaje no reconocido" ($ plus a literal \r\n does not accept it)				
+Well-formed MT300 + \r\n after -}	MT300	no match (13-20 ms)				
+:53	: field start	MT103/MT202	accepted: the class [A	B	D] contains a literal 	 (:48, :52)
+
+The SPID header uses \s* while T24/SPEI use \r?\n? between header and data (copy-paste drift), and {6}?, {3}?, {0,15}? lazy modifiers have no effect. A second CSV row, if Calypso ever sends one, is a second instruction that is dropped without a trace; a trailing line break turns a valid SWIFT message into a rejection.
+Fix: normalise before matching (mensaje = mensaje.Trim().Replace("\r\n", "\n") and use \n), anchor with \z, require exactly one data row, fix [ABD], and add golden-message tests (CL-FR-26). Benefit: the accepted grammar is the documented grammar; nothing is dropped silently. Suggested JIRA: CL-8 (Major)
+CL-FR-9 - A non-business day raises an alert row on every tick (Major, standing GEN-10) File: ValidadorEjecucion.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Servicios/ValidadorEjecucion.cs):54-70; AppLogger.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Comun/AppLogger.cs):56-67; OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):55-58.
+Code block (csharp)
+await _appLogger.LogAsync(TipoLog.WARNING, $"[{nombreServicio}] Día inhábil.",
+                          generarAlerta: true, claveAviso: "DIA_INHABIL");     // every tick
+Issue: a day off is an expected state, yet each tick inserts an alert row (plain INSERT, no de-duplication) and writes two more log lines; the out-of-window branch adds a WARNING line per tick. At the 5 s interval shown in the unused App.config that is 17,280 alert rows per non-business day (8,640 at the 10 s fallback of ServiceHost.cs:38; the real interval lives in the encrypted service configuration, *verify*). Fix: record the state as Omitido, log INFO only on transitions, and alert at most once per transition (shared-library fix recommended in GEN-10). Benefit: the alert table stays meaningful; no notification storm on weekends. Suggested JIRA: CL-9 (Major)
+CL-FR-10 - Results of state writes are awaited and discarded (Minor, standing GEN-9) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):47, 61; ServiceHost.cs (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/ServiceHost.cs):114, 167, 170.
+Code block (csharp)
+await _controlServicio.ActualizaEJecucion(_configuracion.NombreServicio);        // Task<StoredProcedureResult> ignored
+await _controlServicio.MarcarPuertoEnUsoAsync(_configuracionBase.Pid.Value, ...);  // Task<bool> ignored
+Issue: a failed start/stop marker is invisible. Fix: check Exito/the bool, log and alert once. Benefit: the control table can be trusted. Suggested JIRA: CL-10 (Minor)
+CL-FR-11 - Silent defaults when identifiers cannot be parsed (Minor, GEN-12 shape) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):359, 364; SolicitudLiquidacionDTO.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/DTOs/SolicitudLiquidacionDTO.cs):5.
+Code block (csharp)
+IdEnvio   = long.TryParse(liquidacionModel.IdEnvio, out var id)   ? id    : 0,
+MessageId = long.TryParse(liquidacionModel.MessageId, out var mid) ? mid   : (long?)null,
+Issue: id_envio is carried as a string and defaults to 0 when unparsable; the procedure would then insert a liquidation row and its UPDATE ... WHERE id_envio = 0 would flip nothing, leaving the request in RECV to be inserted again on every tick (duplicates). In practice the value comes from a database key, so this is a trap rather than an active bug (*verify* the column is BIGINT). message_id accepts up to 25 digits in the patterns ({1,25}) but a long holds 19, so a longer id silently becomes NULL. Fix: type id_envio as long in the DTO and fail loudly; widen message_id to string/decimal or reject it in the pattern. Benefit: no duplicate rows, no silently dropped identifier. Suggested JIRA: CL-11 (Minor)
+CL-FR-12 - `MT210` is always "Salida" and `MT300` is always valid with no checks (Minor, *verify* with the business owner) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):254-260, 284-288; ConstantesServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Enums/ConstantesServicio.cs):55-60.
+Code block (csharp)
+if (MT103 || MT202 || MT300 || MT210) { ...; sentido = "S"; }
+...
+if (tipoLiquidacionEnum == TipoLiquidacion.MT300) { liquidacionModel.OperacionValida = true; return Ok(); }
+Issue: an MT210 is a SWIFT *Notice to Receive*; the code stores it as MD_MT210_S (outgoing). MT300 (FX confirmation) is accepted before any trade, currency, amount or customer check, and its pattern captures neither cdl nor family/message_id, so the stored row has no customer. These may be deliberate (informational messages), but nothing documents or tests it. Fix: confirm the intended direction/validity per type, then encode it as data (per-type rule objects, CL-FR-15) with a test for each. Benefit: the rule is explicit and reviewable. Suggested JIRA: CL-12 (Minor)
+CL-FR-13 - Captured regex groups are discarded and two mapped keys can never occur (Minor) File: VariablesProcessor.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Helpers/VariablesProcessor.cs):8-24; ConstantesServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Enums/ConstantesServicio.cs):35-60.
+Issue: the seven patterns contain 66 named-group occurrences, but MapearValor maps 11 keys. value_date, operation_code, intermediary_BIC, account_with_*, ben_*, order_BIC, inter_BIC and debit_acct are captured and dropped (executed probe: MT103 returned value_date=[260101] and operation_code=[CRED], neither reaches the model, the XML or the procedure), so the settlement date of a SWIFT instruction is never stored and the MT210 debit account is never compared with T24. nombre_cliente and tipo_liquidacion are mapped (:21-22) but no pattern defines them (dead code). Fix: either map the fields the downstream process needs (confirm value_date first) or convert unused groups to non-capturing; delete the dead cases. Benefit: the contract between pattern, model, XML and table is explicit. Suggested JIRA: CL-13 (Minor)
+CL-FR-14 - Case-insensitive patterns feed case- and whitespace-sensitive comparisons (Minor) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):266-275, 305, 308.
+Code block (csharp)
+RegexOptions.IgnoreCase                                       // ConstantesServicio.cs:24-30
+switch (liquidacionModel.Sentido) { case ConstantesServicio.SentidoReceive: ... }   // ordinal, case-sensitive
+if (datosCuenta.CURRENCY != liquidacionModel.Moneda) ...      // ordinal
+if (datosCuenta.CUSTOMER != liquidacionModel.Cdl) ...         // ordinal, untrimmed
+Issue: executed probe: the T24 pattern accepts usd and RECEIVE; the code then rejects them as "Moneda distinta en T24" / "No se pudo identificar el sentido (receive|pay)" although the message is valid, and stores a lower-case currency otherwise. T24 values may also carry padding or leading zeros (*verify*). Fix: normalise at parse time (Trim(), ToUpperInvariant() for currency, ToLowerInvariant() for sentido) and compare with StringComparison.OrdinalIgnoreCase. Benefit: the same message is accepted or rejected for business reasons only. Suggested JIRA: CL-14 (Minor)
+CL-FR-15 - One 394-line class parses, validates, converts and persists; dispatch is by string key, enum and `if` chains (Minor) File: OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):137-394, TipoLiquidacionExtensions.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Extensiones/TipoLiquidacionExtensions.cs):8-29.
+Issue: the type travels as a string (kvp.Key), is converted by a switch that throws a bare Exception, and is then re-tested by five different if/switch blocks. Adding an eighth type means editing the dictionary, the enum, ToEnum, ValidaOperacion and the procedure. The regexes cannot be tested without running the whole service class. Fix: an IMensajeLiquidacionParser { TipoLiquidacion Tipo; bool TryParse(string, out LiquidacionModel) } and an IReglaValidacion per type, resolved from the container; keep OperacionServicio as the orchestrator. This is the extraction point that makes CL-FR-3, 4, 8, 12, 13, 14 and 26 small, testable changes. Benefit: each type is a unit; new types do not touch existing ones. Suggested JIRA: CL-15 (Minor)
+CL-FR-28 - Nothing prevents the same Calypso instruction from being stored twice, or a rejected leg from being paired (Major, *verify* table constraints) File: 002 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_Liquidacion/IT24/Procedures/002%20SP%20usp_CLiquidacion_InsLiquidacionCompleto.sql):173-221, 225-327; OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):112-125.
+Code block (sql)
+INSERT INTO tbl_calypso_liquidacion (...) VALUES (...);          -- :173-221 unconditional, keyed only by id_envio
+IF @es_liquidacion = 1 ... UPDATE/INSERT tbl_calypso_liquidacion_par ...   -- :225-327 also runs when @operacion_valida = 0
+Issue: every id_envio is processed on its own. Neither the application nor the procedure looks for an existing row with the same calypso_id + tipo_liquidacion + sentido (or message_id) before the insert. The upstream writer usp_RegistrarRespuestaCalypso_Conector is not idempotent (a broker redelivery, a resend or a blank reference inserts a new RECV row, Calypso_Conector finding CCN-FR-5), so a duplicate delivery becomes a second liquidation row and a second pair update. Whether that is stored silently or fails (and then loops, CL-FR-2) depends on unique indexes whose DDL is not in the repository (*verify*). Separately, the pair logic does not look at @operacion_valida: a rejected T24/SPEI/SPID leg (for example "CDL no coincide") still creates or completes a pair row, so a pair can look complete with a leg the service itself refused. Fix: define the idempotency key and enforce it in the procedure; pair only valid legs:
+Code block (sql)
+IF EXISTS (SELECT 1 FROM tbl_calypso_liquidacion
+           WHERE calypso_id = @calypso_id AND tipo_liquidacion = @tipo_liquidacion
+             AND ISNULL(sentido,'') = ISNULL(@sentido,'') AND ISNULL(message_id,0) = ISNULL(@message_id,0))
+BEGIN
+    UPDATE tbl_calypso_intercambio SET estatus = 'DUP' WHERE id_envio = @id_envio;   -- or an agreed status
+    COMMIT; SELECT nf_folio, NULL AS nf_folio_par FROM tbl_calypso_liquidacion WHERE ...; RETURN;
+END
+...
+IF @es_liquidacion = 1 AND @operacion_valida = 1 ...
+Benefit: a redelivered instruction cannot become a second settlement candidate; pairs contain only accepted legs. Suggested JIRA: CL-28 (Major)
+Nice to Rewrite if Time Permits
+CL-FR-16 - Naming, placement and leftovers (Minor) File: ConstantesServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Enums/ConstantesServicio.cs):6; ResultadoEjecucionModel.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Modelos/ResultadoEjecucionModel.cs):7, 17; VariablesProcessor.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Helpers/VariablesProcessor.cs):47; OperacionServicio.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/OperacionServicio.cs):355, 388; AssemblyInfo.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/AssemblyInfo.cs).
+• ConstantesServicio (constants and seven regexes) lives in the Enums folder/namespace; move to Constantes/Patrones.
+• ResultadoEjecucionModel.GetMtBatch is written once and never read (copied from a sibling service); remove.
+• Members named after SQL columns (id_envio, msg_out, nf_folio) and upper-case DTO members (CUSTOMER_CODE) mix three naming styles; map in the repository, expose PascalCase.
+• PersistirOperacionAsync logs under the tag |valida_operacion| (:355); the message at :388 reads "Error el insertar"; an emoji in a comment (VariablesProcessor.cs:47).
+• Two AssemblyInfo.cs files in one project (the root one only declares InternalsVisibleTo, see CL-FR-27): merge into Properties\.
+• The operating-window parameter is HORA_OP_CEP_FIN (ConstantesServicio.cs:9), the end of the CEP window, reused for liquidation (*verify* that this is intended; ValidarHorario also never runs overnight windows where end < start).
+Suggested JIRA: CL-16 (Minor)
+4.2 Infraestructura_C_Liquidacion (Tier 1)
+MustChange / Rewrite
+CL-FR-17 - The TOMI repository ignores the SQL runner's failure flag, so a database error looks like "no work" or a bare `null` (Major, standing GEN-11) File: OperacionesTomiDao.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Repositorios/OperacionesTomiDao.cs):30-39, 47-77.
+Code block (csharp)
+var resultado = await EjecutarStoredProcedureQuery<SolicitudLiquidacionDTO>(ConstantesServicio.uspObtenerSolicitudesLiquidacion, cmd => { });
+return resultado.Data;                                             // :32-33
+...
+var result = await EjecutarStoredProcedureQuery<FolioLiquidacionDTO>(ConstantesServicio.uspInsertarLiquidacionCompleto, cmd => {...}, false);
+var row = result.Data.FirstOrDefault();                            // :74  null when the procedure failed
+return row;
+Issue: in the shared RepositorioMaestro.EjecutarStoredProcedureQuery, a SqlException is caught, stored in spResult.Exito = false / MensajeError / Exception, not logged and not re-thrown; ValidarResultadoStoredProcedure returns immediately when validarAfectacion is false (the default, and this repository never changes it) and the call returns an empty Data list. Consequences here: (a) if usp_CLiquidacion_GetSolicitudesLiquidacion fails (permissions, deadlock, timeout), the service logs "No se encontraron solicitudes" at INFO and carries on: an outage is invisible; (b) if the insert procedure fails, the only trace is the generic "No fue posible persistir la liquidación" with no SQL number or message (CL-FR-2). The try/catch with throw; in the DAO (:35-39, :78-82) never sees the SqlException, so it gives a false sense of coverage. Fix:
+Code block (csharp)
+var resultado = await EjecutarStoredProcedureQuery<SolicitudLiquidacionDTO>(..., cmd => { });
+if (!resultado.Exito)
+    throw new InvalidOperationException(
+        $"{ConstantesServicio.uspObtenerSolicitudesLiquidacion}: {resultado.MensajeError}", resultado.Exception);
+return resultado.Data;
+(the same guard after the insert call; keep the row == null check for the "procedure returned no row" case). Benefit: database failures surface as exceptions with the SQL error text, which CL-FR-7/CL-FR-2 can then handle correctly. Suggested JIRA: CL-17 (Major)
+CL-FR-18 - The alert adapter dereferences a nullable PID inside the error handler (Minor, standing GEN-8) File: AppLogger.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Comun/AppLogger.cs):56-67.
+Code block (csharp)
+PId = _configuracion.Pid.Value,        // Configuracion.Pid is int? (default null)
+Issue: every ManejarErrorAsync and every LogAsync(..., generarAlerta: true) passes through this line. If the PID is not populated (an alert raised before ParametrizacionesAsync has filled the base configuration, or a future code path that builds Configuracion differently) it throws InvalidOperationException from inside the catch block that was trying to report another failure, replacing the original exception. In the normal flow it is populated (ObtenerProcesoActualAsync rejects a missing PID and the per-tick Configuracion is cloned afterwards), so this is latent, not active. Fix: PId = _configuracion.Pid ?? Process.GetCurrentProcess().Id (or make AlertaDTO.PId nullable). Benefit: the error path cannot fail for a reason unrelated to the error it reports. Suggested JIRA: CL-18 (Minor)
+Rewrite Recommended
+CL-FR-19 - `IAppLogger` calls always log an empty method name (Minor) File: IAppLogger.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Interfaces/IAppLogger.cs):9-23; AppLogger.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Comun/AppLogger.cs):28-34.
+Code block (csharp)
+void Log(TipoLog tipo, string mensaje, string metodo = "");                    // interface: no [CallerMemberName]
+public void Log(TipoLog tipo, string mensaje, [CallerMemberName] string metodo = "")   // implementation only
+Issue: C# applies caller-info defaults from the declaration the compiler binds to. Every call in the application goes through IAppLogger, so the default is "" and each line is written as INFO||message. The code compensates by hard-coding method names in the text ("|InterpretaMensaje|...", "Registra_Solicitudes|..."), and one of those tags is wrong (|valida_operacion| inside PersistirOperacionAsync, CL-FR-16). Fix: declare [CallerMemberName] on the interface parameters and drop the manual prefixes. Benefit: correct, automatic method names in every log and alert line. Suggested JIRA: CL-19 (Minor)
+CL-FR-20 - `OperacionesT24Dao` inherits a repository it never uses; the `DataTable` mapper is fragile (Minor) File: OperacionesT24Dao.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Repositorios/OperacionesT24Dao.cs):13-24; DataContextHelpers.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Helpers/DataContextHelpers.cs):11-30.
+Code block (csharp)
+public class OperacionesT24Dao : RepositorioMaestro, IOperacionesT24
+{
+    private readonly Configuracion _configuracion;           // never read
+    ... : base(BasedatosProveedor.SqlServer, NombreBasedatos.T24_VW, null, null)   // opens a second connection factory
+    ... var data = await _t24.DatosClienteVw(cuenta);        // the real work goes through the injected ConexionT24Mw
+}
+...
+prop.SetValue(obj, row[prop.Name]);                          // no type conversion; first row only
+Issue: the class derives from RepositorioMaestro but only calls the injected ConexionT24Mw, so every instance builds an unused connection factory and carries an unused _configuracion. ToEntity<T> throws ArgumentException when a column type differs from the property type (today everything is string in CuentaClienteT24, so it works), silently uses only the first row (an account returned twice is not detected), and reflects over all properties on every call. Fix: compose instead of inheriting (drop the base class and the unused field); in ToEntity convert with Convert.ChangeType or map explicitly, and decide what "more than one row" means for an account. Benefit: smaller object graph, no hidden failure mode if the T24 view changes a column type. Suggested JIRA: CL-20 (Minor)
+4.3 Calypso_Liquidacion - Windows Service host (Tier 2)
+MustChange / Rewrite
+CL-FR-21 - The host reports itself as `ControladorServicios` (Major, GEN-14/GEN-15 copy-paste variant) File: ServiceHost.cs (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/ServiceHost.cs):36, 71; Program.cs (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/Program.cs):14.
+Code block (csharp)
+protected override string NombreServicioLog => NombreServicio.ControladorServicios.ToString();   // ServiceHost.cs:36
+...
+NombreServicio.Calypso_Liquidacion.ToString()                                                   // Program.cs:14 and ServiceHost.cs:71
+Issue: Program and the configuration lookup use Calypso_Liquidacion, but the property the shared WindowsServiceHostBase uses for the service identity returns ControladorServicios: OnStart assigns ServiceName = NombreServicioLog (base:99) and the base writes start-up failures to the Application Event Log under the source NombreServicioLog (base:405-416, which also creates that source if missing). A start-up failure of this service is therefore filed under the same event source as the real ControladorServicios, so operators cannot tell them apart. Peers return their own name (GPH_Descarga, Solicitudes); the same copy-paste exists in Email (GEN-14). Fix: NombreServicio.Calypso_Liquidacion.ToString(); confirm the installed Windows service name (the installer is not in the repository). Benefit: correct identity in the Event Log and in the Service Control Manager. Suggested JIRA: CL-21 (Major)
+CL-FR-22 - The build depends on a binary at `D:\ServiceCMS\MUFG_T24.dll` in all four projects (Blocker, standing GEN-1) File: Aplicacion_C_Liquidacion.csproj (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/Aplicacion_C_Liquidacion.csproj):57, Infraestructura_C_Liquidacion.csproj (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Infraestructura_C_Liquidacion.csproj):54, Calypso_Liquidacion.csproj (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/Calypso_Liquidacion.csproj):64, PruebasUnitarias.csproj (../../CALYPSO/Calypso_Liquidacion/PruebasUnitarias/PruebasUnitarias.csproj):26.
+Code block (xml)
+<Reference Include="MUFG_T24, Version=1.0.0.0, Culture=neutral, processorArchitecture=x86">
+  <SpecificVersion>False</SpecificVersion>
+  <HintPath>D:\ServiceCMS\MUFG_T24.dll</HintPath>
+</Reference>
+Issue: the path does not exist on this machine (the solution cannot be built here), there is no nuget.config or package for it, SpecificVersion=False accepts whatever build is there, and a change in the shared DLL silently changes this service on the next rebuild. The shared source (General\MUFGT24_BTMUM_64) and the interfaces this service mocks can differ from the deployed binary (see CL-FR-25). Secondary: the libraries and host define Debug|AnyCPU/Release|AnyCPU with PlatformTarget AnyCPU next to the x86 configurations, while MUFG_T24 is declared processorArchitecture=x86; the .slnx maps every project to x86, so an Any CPU build outside it produces a bitness mismatch. Fix: publish MUFG_T24 as a versioned internal package and reference it with PackageReference (portfolio-wide fix in GEN-1); remove the AnyCPU configurations or set them to x86. Benefit: reproducible, auditable builds. Suggested JIRA: CL-22 (Blocker)
+Nice to Rewrite if Time Permits
+CL-FR-23 - Stale configuration and repository leftovers (Minor) File: App.config (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/App.config):6-14; ServiceHost.cs (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/ServiceHost.cs):77; README.md (../../CALYPSO/Calypso_Liquidacion/README.md).
+• App.config declares NombreServicio = Calypso_Liquidaciones, TimerEnabled, TimerInterval = 5000, MaxTimeout, PathLog = C:/LogsCMS/CMS/Calypso_Liquidaciones/. Nothing reads ConfigurationManager/appSettings (scan: 0 hits); the real values come from ConfiguracionEncriptadaHelper. The file misleads whoever tunes the interval, and its name (Liquidaciones) differs from the enum (Calypso_Liquidacion).
+• ForzaEjecucionServicios is copied into the base configuration (ServiceHost.cs:77) but neither this solution nor MUFG_T24 reads it (the only references are the property declarations and the copy), so the "force execution" switch has no effect here.
+• README.md is the unmodified GitLab template (93 lines): no purpose, run, config or message-contract documentation.
+• An empty Infraestructura\Properties\ folder is left over from the duplicate project recorded earlier under GEN-3; remove it.
+Suggested JIRA: CL-23 (Minor)
+CL-FR-24 - Obsolete shared logging API (Minor) File: AppLogger.cs (../../CALYPSO/Calypso_Liquidacion/Infraestructura_C_Liquidacion/Comun/AppLogger.cs):33, 54; ServiceHost.cs (../../CALYPSO/Calypso_Liquidacion/Calypso_Liquidacion/ServiceHost.cs):83-84, 118, 139, 148, 154, 172, 181.
+Issue: Config.EscribirLog (8 calls) and MUFG_T24.Logeo_utilidades.Logging (Init/Write) are marked [Obsolete("Legacy compatibility only...")] in MUFG_T24 (Config.cs:11, 145) and forward to Logging.WriteLegacy, which derives the level from the INFO|/WARN|/ERROR| prefix of the text; the file-name argument is ignored. Using Logeo_utilidades.Logging in the same file as Config.EscribirLog mixes two APIs for one sink. Fix: use MUFG_T24.Infraestructura.Logging.Logging.Info/Warn/Error directly (structured level, no prefix parsing). Benefit: no CS0618 warnings; levels are explicit. Suggested JIRA: CL-24 (Minor)
+4.4 PruebasUnitarias (Tier 2)
+MustChange / Rewrite
+CL-FR-25 - The nine tests cannot show that a valid instruction is processed, and some are expected not to run or pass (Major, *verify* against the deployed DLL) File: OperacionServicioUT.cs (../../CALYPSO/Calypso_Liquidacion/PruebasUnitarias/OperacionServicioUT.cs):66, 70, 114, 117, 161, 171, 289 and 88, 184, 249, 303.
+1. Expression-tree incompatibility. Moq Setup takes an expression tree. x.ObtenerFechaSistemaAsync() (:66, :114, :161) and x.ObtenerParametrosSistemaAsync(It.IsAny<string>()) (:70, :117) omit the optional CancellationToken ct = default that the on-disk IParametrizacion declares (IParametrizacion.cs:17, 24). C# rejects optional arguments omitted inside an expression tree (CS0854), so against the shared source in this portfolio the test project is not expected to compile; the deployed MUFG_T24.dll could differ (the same observation is recorded for ControladorServiciosCDL).
+2. Two assertions cannot match. Verify(x => x.ManejarErrorAsync(It.IsAny<Exception>(), It.IsAny<string>(), "", ""), Times.Once) (:171, :289) fixes claveAviso to "", but production calls ManejarErrorAsync(ex, "...") and the compiler passes the declared default "CRITICO" (IAppLogger.cs:19-23). Moq matches constants exactly, so both Verify calls are expected to fail.
+3. The "valid" tests use a message that matches n.o pattern. "MT103 ejemplo válido" (:88, :184, :249, :303) matches none of the seven expressions, so EjecutarProcedimientosAsync_CuandoTodoEsValido_..., RealizaOperaciones_MensajeValido_..., ..._ValidacionFalla_DebeInsertarConRechazo (whose comment says "Cliente existe pero CDL nulo", never reached) and ..._DebeGenerarXml all run the "Mensaje no reconocido" path. They pass because a rejection is also persisted and "<row" is also part of the placeholder <row/> (:157). No test reaches ValidaOperacion, the T24 branch, the XML builder with data or a successful insert.
+4. Names promise more than they assert (RealizaOperaciones_CuandoHayExcepcion_DebeInsertarError verifies only a logger call).
+Fix: pass explicit arguments (ObtenerFechaSistemaAsync(It.IsAny<CancellationToken>())), match claveAviso/metodo with It.IsAny<string>(), use realistic fixtures (CL-FR-26) and assert on the persisted LiquidacionDTO fields. Benefit: green means "behaves", red means "broken". Suggested JIRA: CL-25 (Major)
+CL-FR-26 - None of the business-critical logic is covered (Major, standing GEN-2) File: whole solution; PruebasUnitarias\OperacionServicioUT.cs is the only test class.
+Issue: untested: the seven patterns (66 groups), MapearValor/ConvertirXml, ValidadorEjecucion (business day, window, inverted window), ValidaOperacion (the three T24 reject reasons, the CDL check, MT300 shortcut, sentido mapping, amount conversion), cancellation (CL-FR-1), regex timeout (CL-FR-3), both repositories' procedure contracts and DataContextHelpers, and the container composition (Verify()). Everything that decides whether a payment instruction is accepted has no regression net. Fix: start with table-driven tests on the pure code, using masked real msg_out samples as golden files:
+Code block (csharp)
+[DataTestMethod]
+[DataRow("T24",  "TRANSACTION_TYPE,TRADE ID,...\r\nT24,1001,2002,EXT1,123456789,USD,1,234.50,receive,12345,ACME SA,FX,99", "1234.50", "E")]
+[DataRow("MT103", "{1:F01BTMUMXMMAXXX0000000000}{2:I103CORPUS33XXXXN}{3:{108:MT103}}{4:\r\n:20:555\r\n...-}", "1000.50", "S")]
+public void Interpreta_y_normaliza(string tipo, string mensaje, string montoEsperado, string sentidoEsperado) { ... }
+ 
+[TestMethod] public void MT300_con_bloques_repetidos_y_sin_terminador_termina_en_menos_de_2s() { ... }
+[TestMethod] public async Task Cancelacion_deja_la_solicitud_sin_persistir() { ... }
+Benefit: the rules that move money are executable specifications; CL-FR-1/3/4/8/14 get regression tests as they are fixed. Suggested JIRA: CL-26 (Major)
+Rewrite Recommended
+CL-FR-27 - Test project package, licence and attribute hygiene (Minor) File: PruebasUnitarias.csproj (../../CALYPSO/Calypso_Liquidacion/PruebasUnitarias/PruebasUnitarias.csproj):12-16; AssemblyInfo.cs (../../CALYPSO/Calypso_Liquidacion/Aplicacion_C_Liquidacion/AssemblyInfo.cs):4.
+• FluentAssertions 8.10.0: from version 8 the library is under a commercial licence for non-open-source use (*verify* with Legal/licensing); 7.x remains Apache-2.0, or use MSTest Assert/Shouldly.
+• MSTest 4.0.2 (meta-package that already brings the adapter and framework) is combined with explicit MSTest.TestAdapter and MSTest.TestFramework 4.2.3; keep one version.
+• [assembly: InternalsVisibleTo("PuebasUnitarias")] is misspelled (the project is PruebasUnitarias): any future internal test seam would silently fail to compile. Nothing uses it today; correct or remove it.
+• Nullable is enabled with = null! fields; fine, but the production projects are not nullable-annotated, so the benefit is local only.
+Suggested JIRA: CL-27 (Minor)
+5. Architecture-Fit Note
+Applying the standing question in section 6 of the control document (./_ORCHESTRATION.md): this service is a timer-driven polling consumer over a table used as a queue (tbl_calypso_intercambio, RECV -> PROC), whose work per message is a single short transform-validate-persist step with the transaction and the E/S pairing inside one stored procedure. That is closer to the "message-driven" row of the trade-off table than to a "workflow/saga engine": the genuinely multi-step part (pair completion and whatever posts the liquidation in T24) lives downstream and is not in this repository, so there is nothing here to justify a saga engine or microservice split. The recommended sequence is the portfolio one: (1) fix the defects that lose, duplicate or hide instructions (CL-FR-1, 2, 4, 5, 17, 7, 28), bound the work per tick (CL-FR-3) and align identity/build (CL-FR-21, 22); (2) extract the parsers and rules, then cover them with golden-message tests (CL-FR-15, 26, 25); (3) only then decide on hosting: modernise in place (.NET 8 worker, same layering) or move the intake to a queue. The decision needs facts this audit cannot see: message volume and peak rate, the real timer interval (held in the encrypted configuration), the latency Calypso/operations expect between RECV and a usable row, hosting constraints, and who consumes tbl_calypso_liquidacion. A full rewrite is not recommended from a code-quality review alone.
+6. JIRA-Ready Backlog
+ID	Title	Category	Project	File(s)	Priority
+CL-22	Reference MUFG_T24 through an internal package instead of D:\ServiceCMS (and align platform configs)	MustChange/rewrite	All four	four .csproj	Blocker
+CL-1	Never convert cancellation into a business rejection; leave the request in RECV	MustChange/rewrite	Aplicacion	OperacionServicio.cs	Major
+CL-2	Bound retries and quarantine requests that cannot be stored; make persistence return an outcome	MustChange/rewrite	Aplicacion	OperacionServicio.cs, new SP	Major
+CL-3	Add regex match timeouts; rewrite MT300 (and the SWIFT patterns) as a tag parser	MustChange/rewrite	Aplicacion	ConstantesServicio.cs, OperacionServicio.cs	Major
+CL-4	Parse amounts once with an explicit format; reject invalid/zero; stop storing NULL on valid rows	MustChange/rewrite	Aplicacion + SQL	OperacionServicio.cs, 002 SP	Major
+CL-5	Persist short reason codes, not exception text; stop duplicating traces in alerts	MustChange/rewrite	Aplicacion	OperacionServicio.cs	Major
+CL-7	Finalise the tick in a finally; stop reporting a failed read as success	MustChange/rewrite	Aplicacion	OperacionServicio.cs	Major
+CL-17	Throw on !Exito in the TOMI repository so SQL failures are visible	MustChange/rewrite	Infraestructura	OperacionesTomiDao.cs	Major
+CL-21	Return Calypso_Liquidacion from NombreServicioLog	MustChange/rewrite	Host	ServiceHost.cs	Major
+CL-25	Make the unit tests compile and assert on real success/rejection paths	MustChange/rewrite	Tests	OperacionServicioUT.cs	Major
+CL-26	Add golden-message and rule tests for patterns, validator, XML, DAOs	MustChange/rewrite	Tests	new test classes	Major
+CL-8	Normalise input and anchor the seven patterns consistently (\z, one data row, [ABD])	rewrite_recommended	Aplicacion	ConstantesServicio.cs	Major
+CL-9	Alert once per non-business-day transition, not on every tick	rewrite_recommended	Aplicacion	ValidadorEjecucion.cs, AppLogger.cs	Major
+CL-28	Enforce an idempotency key for instructions in the insert procedure; pair only valid legs	rewrite_recommended	Aplicacion + SQL	002 SP, OperacionServicio.cs	Major
+CL-6	Fix ValidaOperacion guard order and null amount handling	MustChange/rewrite	Aplicacion	OperacionServicio.cs	Minor
+CL-18	Guard the nullable PID in the alert adapter	MustChange/rewrite	Infraestructura	AppLogger.cs	Minor
+CL-10	Check the results of start/stop state writes	rewrite_recommended	Aplicacion, Host	OperacionServicio.cs, ServiceHost.cs	Minor
+CL-11	Remove silent 0/NULL defaults for id_envio and message_id	rewrite_recommended	Aplicacion	OperacionServicio.cs, DTO	Minor
+CL-12	Confirm and encode the MT210 direction and MT300 validity rules	rewrite_recommended	Aplicacion	OperacionServicio.cs	Minor
+CL-13	Map or drop captured regex groups; remove dead mapping cases	rewrite_recommended	Aplicacion	VariablesProcessor.cs, ConstantesServicio.cs	Minor
+CL-14	Normalise case/whitespace before comparing currency, direction and customer	rewrite_recommended	Aplicacion	OperacionServicio.cs	Minor
+CL-15	Extract per-type parsers and rules (IMensajeLiquidacionParser)	rewrite_recommended	Aplicacion	OperacionServicio.cs, extensions	Minor
+CL-19	Declare [CallerMemberName] on IAppLogger	rewrite_recommended	Aplicacion, Infraestructura	IAppLogger.cs, AppLogger.cs	Minor
+CL-20	Compose instead of inheriting RepositorioMaestro; harden ToEntity	rewrite_recommended	Infraestructura	OperacionesT24Dao.cs, DataContextHelpers.cs	Minor
+CL-27	Align test packages, review FluentAssertions licence, fix InternalsVisibleTo typo	rewrite_recommended	Tests	PruebasUnitarias.csproj, AssemblyInfo.cs	Minor
+CL-16	Naming, placement and dead members	NiceToRewrite_ifTimePermits	Aplicacion	several	Minor
+CL-23	Remove stale App.config keys, dead ForzaEjecucionServicios, template README, empty folder	NiceToRewrite_ifTimePermits	Host	App.config, ServiceHost.cs, README.md	Minor
+CL-24	Replace obsolete Config.EscribirLog/Logeo_utilidades.Logging	NiceToRewrite_ifTimePermits	Infraestructura, Host	AppLogger.cs, ServiceHost.cs	Minor
+
+7. Open Questions (facts not in the repository)
+1. What do real msg_out values look like for each type (line endings, trailing break, amount formats, MT300 field repetition, second CSV rows)? Needed to settle CL-FR-3, 4, 8, 14.
+2. What is the real timer interval and window? (the 5000 in App.config is not read; the 10 s fallback is in code.) Drives the alert volumes in CL-FR-9 and the exposure in CL-FR-2.
+3. Column sizes and constraints of tbl_calypso_liquidacion.err_descripcion, tbl_calypso_intercambio.id_envio and the T24 view columns (CL-FR-2, 5, 11, 14).
+4. Intended direction of MT210 and the validation expected of MT300 (CL-FR-12); is value_date required downstream (CL-FR-13)?
+5. Which MUFG_T24.dll build is deployed, and does its IParametrizacion still declare the optional CancellationToken parameters (CL-FR-25)?
+6. Who consumes tbl_calypso_liquidacion / tbl_calypso_liquidacion_par, which unique indexes exist on them, and does the consumer treat a pair with a rejected leg (operacion_valida = 0, es_liquidacion = 1) as complete (CL-FR-28)? The procedure still creates or updates the pair row for a rejected T24/SPEI/SPID leg, and Calypso_Conector can deliver the same instruction twice (CCN-FR-5).
