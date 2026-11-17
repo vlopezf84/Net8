@@ -1,0 +1,456 @@
+    Private Function interpretar_MX_PACS008(mensaje As String, ByRef variables_XML As String, ByRef razonRechazo As String, ICN As String, objPACS008 As ResponsePACS) As Boolean
+        Dim lsNodoXML As String
+        Dim lsDireccionConcat As String 
+        Dim laMultivalorMX As List(Of String)
+        Dim laMultivalorMXAux As List(Of String)
+        Dim laMultivalorMXBen As List(Of String)
+        Dim totalLineasNameOrd = 0, totalLineasDir = 0, totalLineasNameBen = 0
+        Dim lsCurrency As String
+
+        lsCurrency = ""
+        
+        Dim cbprMessage As XDocument = RemoveNamespace(mensaje)
+
+        'Valores que obtiene del encabezado de la MQ
+        agrega_valor_xml(variables_XML, "ICN", ICN)
+
+        If objPACS008.appHdr.frBICFI <> "" Then
+            agrega_valor_xml(variables_XML, "CIF_sender", "NSWF" & objPACS008.appHdr.frBICFI)
+        End If
+
+        ' Banco Emisor
+        If objPACS008.instgAgtBICFI <> "" Then
+            agrega_valor_xml(variables_XML, "banco_emisor", objPACS008.instgAgtBICFI)
+        End If
+
+        ' Banco Receptor
+        If objPACS008.instdAgtBICFI <> "" Then
+            agrega_valor_xml(variables_XML, "banco_receptor", objPACS008.instdAgtBICFI)
+        End If
+        
+        ' UETR
+        If objPACS008.pmtId.uetr <> "" Then
+            agrega_valor_xml(variables_XML, "UETR", objPACS008.pmtId.uetr)
+        End If
+
+        'mensaje tipo
+        agrega_valor_xml(variables_XML, "mensaje_tipo", "PACS008") ' preguntar
+
+
+        'Sender's Reference        
+        If objPACS008.pmtId.instrId <> "" Then
+            agrega_valor_xml(variables_XML, "sender_reference", objPACS008.pmtId.instrId)
+        End If
+
+        'Bank Operation Code
+        If objPACS008.pmtTpInfPrtry <> "" Then
+            agrega_valor_xml(variables_XML, "bank_op_code", objPACS008.pmtTpInfPrtry)
+        End If
+
+        'Instruction Code
+        If objPACS008.instrForCdtrAgtCd <> "" Then
+            agrega_valor_xml(variables_XML, "instruction_code", objPACS008.instrForCdtrAgtCd)
+            agrega_valor_xml(variables_XML, "instruction_add_info", objPACS008.instrForCdtrAgtCd)
+        End If
+
+        'Transaction Type Code
+        If objPACS008.purpPrtry <> "" Then
+            agrega_valor_xml(variables_XML, "trans_type_code", objPACS008.purpPrtry)
+        End If
+
+        'Fecha Valor (Tendria que transformar a un formato que aun desconozco)
+        If objPACS008.intrBkSttlmDt <> "" Then
+            agrega_valor_xml(variables_XML, "settled_date", texto_to_fecha(objPACS008.intrBkSttlmDt))
+        End If
+
+        ' Moneda
+        If objPACS008.intrBkSttlmAmtCcy <> "" Then
+            lsCurrency = objPACS008.intrBkSttlmAmtCcy
+            agrega_valor_xml(variables_XML, "mensaje_moneda", lsCurrency) ' viene como propiedad la moneda
+            agrega_valor_xml(variables_XML, "settled_ccy", lsCurrency) ' viene como propiedad la moneda
+        End If
+
+        ' Importe (Mandatory)
+        If objPACS008.intrBkSttlmAmt <> "" Then
+            agrega_valor_xml(variables_XML, "mensaje_importe", objPACS008.intrBkSttlmAmt)
+            agrega_valor_xml(variables_XML, "settled_amount", objPACS008.intrBkSttlmAmt)
+        Else
+            razonRechazo = "No se pudo leer el mensaje para establecer el importe."
+            Return False
+        End If
+
+        'Moneda Ordenado        
+        If objPACS008.instdAmtCcy <> "" Then
+            agrega_valor_xml(variables_XML, "instructed_ccy", objPACS008.instdAmtCcy)
+        End If
+
+        ' Importe Ordenado
+        If objPACS008.instdAmt <> "" Then
+            agrega_valor_xml(variables_XML, "instructed_amount", objPACS008.instdAmt)
+        End If
+
+        'Tipo de Cambio
+        If objPACS008.xchgRate <> "" Then
+            agrega_valor_xml(variables_XML, "ex_rate", objPACS008.xchgRate)
+        End If
+
+        'Debtor Account 
+        If objPACS008.dbtr.acctIdOthrId <> "" Then
+            agrega_valor_xml(variables_XML, "ordering_account", objPACS008.dbtr.acctIdOthrId)
+        End If
+        
+        Dim settlementMethod As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/GrpHdr/SttlmInf/SttlmMtd")
+        If Not String.IsNullOrWhitespace(settlementMethod) Then
+            agrega_valor_xml(variables_XML, "settlement_method", settlementMethod)
+        End If
+
+        'Debtor Name
+        laMultivalorMX = New List(Of String)
+        laMultivalorMXAux = New List(Of String)
+        If objPACS008.dbtr.nm <> "" Then
+            agrega_valor_xml(variables_XML, "ordering_name", objPACS008.dbtr.nm)
+            laMultivalorMX = convierteTexto_a_Multivalor_SinCortar_Local(objPACS008.dbtr.nm, 35, totalLineasNameOrd)
+
+            write_Log("INFO|interpreta_mensajes|totalLineasNameOrd =" & totalLineasNameOrd.ToString)
+            write_Log("INFO|interpreta_mensajes|laMultivalorMX.Count =" & laMultivalorMX.Count.ToString)
+            'Si el nombre rebasa las 2 lineas, mandamos al campo extra las lineas restantes
+            If (totalLineasNameOrd > 2) Then
+                laMultivalorMX = regresaNLineasDeMultivalor(laMultivalorMX, 2, laMultivalorMXAux)
+                If laMultivalorMXAux.Count > 0 Then
+                    'agregamos 
+                    agrega_valor_xml(variables_XML, "ordering_cust_nm_ext", Nothing, convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux), 65, totalLineasNameOrd))
+                End If
+            End If
+        End If
+
+        'Debtor address
+        If Not objPACS008.dbtr.pstlAdr Is Nothing Then
+            totalLineasNameOrd = laMultivalorMX.Count
+            If objPACS008.dbtr.pstlAdr.adrLine.Count > 0 Then ' si existe AdrlLine es una dirección no Estructurada
+                
+                lsNodoXML = Join(objPACS008.dbtr.pstlAdr.adrLine, " ")
+                write_Log("INFO|interpreta_mensajes|Direccion Completa =" & lsNodoXML)
+                
+                ' Hybrid
+                If objPACS008.dbtr.pstlAdr.ctry <> "" Then
+                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.dbtr.pstlAdr.ctry)
+                End If
+                ' TownName debe ser requerido
+                If objPACS008.dbtr.pstlAdr.twnNm <> "" Then
+                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.dbtr.pstlAdr.twnNm)
+                End If
+                
+                ' Separamos en lineas de 35
+                laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsNodoXML, 35, totalLineasDir)
+                write_Log("INFO|interpreta_mensajes|Lineas de la direccion del ordenate =" & laMultivalorMXAux.Count.ToString)
+            Else ' Es una dirección Estructurada leemos cada tag    
+                If objPACS008.dbtr.pstlAdr.strtNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.strtNm)
+                End If
+                If objPACS008.dbtr.pstlAdr.bldgNb <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.bldgNb)
+                End If
+                If objPACS008.dbtr.pstlAdr.bldgNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.bldgNm)
+                End If
+                If objPACS008.dbtr.pstlAdr.flr <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.flr)
+                End If
+                If objPACS008.dbtr.pstlAdr.pstBx <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.pstBx)
+                End If
+                If objPACS008.dbtr.pstlAdr.room <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.room)
+                End If
+                If objPACS008.dbtr.pstlAdr.dept <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.dept)
+                End If
+                If objPACS008.dbtr.pstlAdr.subDept <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.subDept)
+                End If
+                'Country debe ser requerido ++++++ OJO AQUI ++++++
+                If objPACS008.dbtr.pstlAdr.ctry <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.ctry)
+                End If
+                ' TownName debe ser requerido
+                If objPACS008.dbtr.pstlAdr.twnNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.twnNm)
+                End If
+                If objPACS008.dbtr.pstlAdr.pstCd <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.pstCd)
+                End If
+                If objPACS008.dbtr.pstlAdr.ctrySubDvsn <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.ctrySubDvsn)
+                End If
+                If objPACS008.dbtr.pstlAdr.twnLctnNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.twnLctnNm)
+                End If
+                If objPACS008.dbtr.pstlAdr.dstrctNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.dstrctNm)
+                End If
+                If lsDireccionConcat <> "" Then
+                    laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsDireccionConcat, 35, totalLineasDir)
+                End If
+            End If
+
+            ' Agregamos al array principal la o las lineas que quepan referente a la direccion
+            If laMultivalorMX.Count = 2 Then
+                write_Log("INFO|interpreta_mensajes|Array principal con 2 o mas lineas =" & laMultivalorMX.Count.ToString)
+                laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 1))
+            ElseIf laMultivalorMX.Count = 1 Then
+                write_Log("INFO|interpreta_mensajes|Array principal con 1 o menos lineas =" & laMultivalorMX.Count.ToString)
+                If laMultivalorMXAux.Count = 1 Then
+                    laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 1))
+                Else
+                    laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 2))
+                End If
+            End If
+
+
+            ' Si el total de lineas de la direccion superan a las que podia ingresar, las agregamos al nuevo campo
+            If totalLineasDir > (3 - totalLineasNameOrd) Then
+                agrega_valor_xml(variables_XML, "ordering_cust_adr_ext", Nothing, convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux.GetRange((3 - totalLineasNameOrd), totalLineasDir - (3 - totalLineasNameOrd))), 65, totalLineasNameOrd))
+            End If
+        End If
+
+        If laMultivalorMX.Count > 0 Then
+            agrega_valor_xml(variables_XML, "ordering_name_addr", Nothing, laMultivalorMX)
+        End If
+
+        If objPACS008.dbtrAgt.nm <> "" Then
+            agrega_valor_xml(variables_XML, "order_inst_name", objPACS008.dbtrAgt.nm)
+            laMultivalorMX.Add(objPACS008.dbtrAgt.nm)
+        End If
+
+        If Not objPACS008.dbtrAgt.pstlAdr Is Nothing Then
+            If objPACS008.dbtrAgt.pstlAdr.adrLine.Count > 0 Then ' si existe AdrlLine es una dirección no Estructurada
+                'lsNodoXML = busca_valor_xml_MX(lsNodoXML, "AdrLine", "Value", laMultivalorMX)
+                laMultivalorMX.AddRange(objPACS008.dbtrAgt.pstlAdr.adrLine)
+            End If
+        End If
+        If laMultivalorMX.Count > 0 Then
+            agrega_valor_xml(variables_XML, "order_inst_name_addr", Nothing, laMultivalorMX)
+        End If
+
+        'Ordering Instruction
+        If objPACS008.dbtrAgt.nm <> "" Then
+            agrega_valor_xml(variables_XML, "order_inst_party", objPACS008.dbtrAgt.nm)
+        End If
+
+        'Ordering Institution BIC
+        Dim dbtrAgentBic As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/CdtTrfTxInf/DbtrAgt/FinInstnId/BICFI")
+        If Not String.IsNullOrWhitespace(dbtrAgentBic) Then
+            agrega_valor_xml(variables_XML, "order_inst_bic", dbtrAgentBic)
+        End If
+
+        'Creditor Account 
+        If objPACS008.cdtr.acctIdOthrId <> "" Then
+            agrega_valor_xml(variables_XML, "beneficiary_account", objPACS008.cdtr.acctIdOthrId)
+        End If
+        
+        ' Our Correspondent 
+        Dim instdRmbrsmntBic As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/GrpHdr/SttlmInf/InstdRmbrsmntAgt/FinInstnId/BICFI")
+        If Not String.IsNullOrWhitespace(instdRmbrsmntBic) Then
+            agrega_valor_xml(variables_XML, "rec_corr_bic", instdRmbrsmntBic)
+        End If
+        
+        Dim instgRmbrsmntBic As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/GrpHdr/SttlmInf/InstgRmbrsmntAgt/FinInstnId/BICFI")
+        If Not String.IsNullOrWhitespace(instgRmbrsmntBic) Then
+            agrega_valor_xml(variables_XML, "send_corr_bic", instgRmbrsmntBic)
+        End If
+        
+        Dim intermediaryAgent As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/CdtTrfTxInf/IntrmyAgt1/FinInstnId/BICFI")
+        If Not String.IsNullOrWhitespace(intermediaryAgent) Then
+            agrega_valor_xml(variables_XML, "int_cif", intermediaryAgent)
+        End If
+
+        'Creditor Name
+        laMultivalorMX = New List(Of String)
+        laMultivalorMXAux = New List(Of String)
+        laMultivalorMXBen = New List(Of String)
+        totalLineasDir = 0
+        lsDireccionConcat = ""
+        If objPACS008.cdtr.nm <> "" Then
+            laMultivalorMX = convierteTexto_a_Multivalor_SinCortar_Local(objPACS008.cdtr.nm, 35, totalLineasNameBen)
+
+            'Si el nombre rebasa las 2 lineas, mandamos al campo extra las lineas restantes
+            If (totalLineasNameBen > 2) Then
+                write_Log("INFO|interpreta_mensajes|A|totalLineasNameBen =" & totalLineasNameBen.ToString)
+                laMultivalorMX = regresaNLineasDeMultivalor(laMultivalorMX, 2, laMultivalorMXAux)
+                If laMultivalorMXAux.Count > 0 Then
+                    'Agregamos las lineas que no caben a la lista extra, estas lineas son de 65 caracteres
+                    write_Log("INFO|interpreta_mensajes|B|laMultivalorMXAux.Count =" & laMultivalorMXAux.Count.ToString)
+                    laMultivalorMXBen = convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux), 65, totalLineasNameBen)
+                End If
+            End If
+        End If
+
+        'Creditor address
+        If Not objPACS008.cdtr.pstlAdr Is Nothing Then
+
+            totalLineasNameBen = laMultivalorMX.Count
+            write_Log("INFO|interpreta_mensajes|totalLineasNameBen =" & totalLineasNameBen.ToString)
+            If objPACS008.cdtr.pstlAdr.adrLine.Count > 0 Then 
+                lsNodoXML = Join(objPACS008.cdtr.pstlAdr.adrLine, " ")
+                
+                ' Hybrid
+                If objPACS008.cdtr.pstlAdr.ctry <> "" Then
+                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.cdtr.pstlAdr.ctry)
+                End If
+                ' TownName debe ser requerido
+                If objPACS008.cdtr.pstlAdr.twnNm <> "" Then
+                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.cdtr.pstlAdr.twnNm)
+                End If
+                
+                write_Log("INFO|interpreta_mensajes|AdrLine =" & lsNodoXML)
+                laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsNodoXML, 35, totalLineasDir)
+                write_Log("INFO|interpreta_mensajes|laMultivalorMXAux.Count =" & laMultivalorMXAux.Count.ToString)
+            Else
+                If objPACS008.cdtr.pstlAdr.strtNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.strtNm)
+                End If
+                If objPACS008.cdtr.pstlAdr.bldgNb <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.bldgNb)
+                End If
+                If objPACS008.cdtr.pstlAdr.bldgNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.bldgNm)
+                End If
+                If objPACS008.cdtr.pstlAdr.flr <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.flr)
+                End If
+                If objPACS008.cdtr.pstlAdr.pstBx <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.pstBx)
+                End If
+                If objPACS008.cdtr.pstlAdr.room <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.room)
+                End If
+                If objPACS008.cdtr.pstlAdr.dept <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.dept)
+                End If
+                If objPACS008.cdtr.pstlAdr.subDept <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.subDept)
+                End If
+                'Country debe ser requerido
+                If objPACS008.cdtr.pstlAdr.ctry <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.ctry)
+                End If
+                ' TownName debe ser requerido
+                If objPACS008.cdtr.pstlAdr.twnNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.twnNm)
+                End If
+                If objPACS008.cdtr.pstlAdr.pstCd <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.pstCd)
+                End If
+                If objPACS008.cdtr.pstlAdr.ctrySubDvsn <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.ctrySubDvsn)
+                End If
+                If objPACS008.cdtr.pstlAdr.twnLctnNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.twnLctnNm)
+                End If
+                If objPACS008.cdtr.pstlAdr.dstrctNm <> "" Then
+                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.dstrctNm)
+                End If
+
+            End If
+            If lsDireccionConcat <> "" Then
+                laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsDireccionConcat, 35, totalLineasDir)
+            End If
+        End If
+
+        ' Agregamos al array principal la o las lineas que quepan referente a la direccion
+        If laMultivalorMX.Count = 2 Then
+            write_Log("INFO|interpreta_mensajes|Array principal con 2 o mas lineas =" & laMultivalorMX.Count.ToString)
+            'laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 3 - totalLineasNameBen))
+            laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 1))
+        ElseIf laMultivalorMX.Count = 1 Then
+            write_Log("INFO|interpreta_mensajes|1|laMultivalorMX.Count =" & laMultivalorMX.Count.ToString)
+            'laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 2 - totalLineasNameBen))
+            If laMultivalorMXAux.Count > 0 Then
+                laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, laMultivalorMXAux.Count))
+            End If
+        End If
+
+        ' Si el total de lineas de la direccion superan a las que podia ingresar, las agregamos al nuevo campo
+        If totalLineasDir > (3 - totalLineasNameBen) Then
+            laMultivalorMXBen.AddRange(convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux.GetRange((3 - totalLineasNameBen), totalLineasDir - (3 - totalLineasNameBen))), 65, totalLineasNameBen))
+            agrega_valor_xml(variables_XML, "beneficiary_name_ext", Nothing, laMultivalorMXBen)
+        ElseIf laMultivalorMXBen.Count > 0 Then
+
+            agrega_valor_xml(variables_XML, "beneficiary_name_ext", Nothing, laMultivalorMXBen)
+        End If
+
+        If laMultivalorMX.Count > 0 Then
+            agrega_valor_xml(variables_XML, "beneficiary_name_addr", Nothing, laMultivalorMX)
+        End If
+
+        'Remittance Information
+        If objPACS008.rmtInfUstrd <> "" Then
+            agrega_valor_xml(variables_XML, "remmitance_information", objPACS008.rmtInfUstrd)
+        End If
+
+        'Detail of Charges
+        If objPACS008.chrgBr <> "" Then
+            Select Case objPACS008.chrgBr
+                Case "CRED"
+                    agrega_valor_xml(variables_XML, "detail_charges", "BEN")
+                Case "DEBT"
+                    agrega_valor_xml(variables_XML, "detail_charges", "OUR")
+                Case "SHAR"
+                    agrega_valor_xml(variables_XML, "detail_charges", "SHA")
+            End Select
+        End If
+        
+
+        ' Sender's Charges Amount        
+        If objPACS008.chrgsInfAmt <> "" Then
+            agrega_valor_xml(variables_XML, "sender_amount", objPACS008.chrgsInfAmt)
+        End If
+        
+        Dim account As String
+        If lsCurrency = "USD" Then
+            ' La unica moneda que puede liquidarse por dos cuenta son los USD, de otra manera obtenemos la cuenta predeterminada.
+            Dim bic As String
+            If settlementMethod = "COVE" And Not String.IsNullOrWhiteSpace(instdRmbrsmntBic) Then
+                bic = instdRmbrsmntBic
+                write_Log("INFO|NostroAccount|A usar el BIC de nuestro corresponsal (tag 54a): " & bic)
+            ElseIf settlementMethod = "COVE" And Not String.IsNullOrWhiteSpace(instgRmbrsmntBic) Then
+                bic = instgRmbrsmntBic
+                write_Log("INFO|NostroAccount|A usar el BIC de nuestro corresponsal (tag 53a): " & bic)
+            Else 
+                bic = objPACS008.appHdr.frBICFI
+                write_Log("INFO|NostroAccount|A usar el BIC de quien emitio el mensaje: " & bic)
+            End If
+        
+            Dim debitAccountResult As Result(Of String) = GetDebitAccount(bic, lsCurrency) 
+            If debitAccountResult.IsSuccess Then
+                account = debitAccountResult.Data
+            Else 
+                Dim alert AS String = "No se encontro cuenta NOSTRO para el corresponsal, se busca cuenta del emisor: " & objPACS008.appHdr.frBICFI
+                Dim fallbackResult As Result(Of String) = GetDebitAccount(objPACS008.appHdr.frBICFI, lsCurrency) 
+                If fallbackResult.IsSuccess Then
+                    account = fallbackResult.Data
+                Else 
+                    alert = "No se encontro cuenta NOSTRO para el corresponsal ni para el emisor del mensaje, se utilizara la cuenta predeterminada en caso de autorizacion automatica (JP Morgan)"
+                    account = goT24_Connection.T24_NOSTRO_Account(lsCurrency)
+                End If
+                agrega_alerta(ICN, alert)
+            End If
+        Else 
+            Try
+                account = goT24_Connection.T24_NOSTRO_Account(lsCurrency)    
+            Catch ex As Exception
+                account = string.Empty    
+            End Try
+        End If
+        
+        If Not string.IsNullOrWhiteSpace(account) Then
+            agrega_valor_xml(variables_XML, "debit_account", account)
+        End If
+                                            
+        If string.IsNullOrWhiteSpace(account) And Not lsCurrency = "MXN" Then
+            razonRechazo = "No se encontro una cuenta a debitar."
+            Return False
+        End If
+        
+        Return True
+    End Function
