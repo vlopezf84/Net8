@@ -1,456 +1,2720 @@
-    Private Function interpretar_MX_PACS008(mensaje As String, ByRef variables_XML As String, ByRef razonRechazo As String, ICN As String, objPACS008 As ResponsePACS) As Boolean
-        Dim lsNodoXML As String
-        Dim lsDireccionConcat As String 
-        Dim laMultivalorMX As List(Of String)
-        Dim laMultivalorMXAux As List(Of String)
-        Dim laMultivalorMXBen As List(Of String)
-        Dim totalLineasNameOrd = 0, totalLineasDir = 0, totalLineasNameBen = 0
-        Dim lsCurrency As String
+using AplicacionConector;
+using AplicacionConector.Enums;
+using AplicacionConector.Interfaces;
+using AplicacionConector.Utilidades;
+using InfraestructuraConector.HSM;
+using InfraestructuraConector.SOAP;
+using MUFG_T24.Comunes;
+using MUFG_T24.Comunes.Encriptacion;
+using MUFG_T24.Configuracion_utilidades;
+using MUFG_T24.Inicializacion_utilidades;
+using MUFG_T24.Interfaces_utilidades;
+using MUFG_T24.Logeo_utilidades;
+using MUFG_T24.Modelos;
+using SimpleInjector;
+using SimpleInjector.Lifestyles;
+using System;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.ServiceProcess;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
-        lsCurrency = ""
-        
-        Dim cbprMessage As XDocument = RemoveNamespace(mensaje)
+namespace Conector
+{
+    /// <summary>
+    /// Clase principal del servicio Windows (presentación).
+    /// </summary>
+    public partial class ServiceHost : ServiceBase
+    {
+        private readonly string[] _startupArgs;
 
-        'Valores que obtiene del encabezado de la MQ
-        agrega_valor_xml(variables_XML, "ICN", ICN)
+        private SimpleInjector.Container _containerDI;
+        private Configuracion _configuracionBase;
 
-        If objPACS008.appHdr.frBICFI <> "" Then
-            agrega_valor_xml(variables_XML, "CIF_sender", "NSWF" & objPACS008.appHdr.frBICFI)
-        End If
+        private CancellationTokenSource _cts;
 
-        ' Banco Emisor
-        If objPACS008.instgAgtBICFI <> "" Then
-            agrega_valor_xml(variables_XML, "banco_emisor", objPACS008.instgAgtBICFI)
-        End If
+        private Task _startupTask;
 
-        ' Banco Receptor
-        If objPACS008.instdAgtBICFI <> "" Then
-            agrega_valor_xml(variables_XML, "banco_receptor", objPACS008.instdAgtBICFI)
-        End If
-        
-        ' UETR
-        If objPACS008.pmtId.uetr <> "" Then
-            agrega_valor_xml(variables_XML, "UETR", objPACS008.pmtId.uetr)
-        End If
+        private TcpListener _tcpListener;
+        private Task _listenerTask;
 
-        'mensaje tipo
-        agrega_valor_xml(variables_XML, "mensaje_tipo", "PACS008") ' preguntar
+        private static int _workerSequence;
+        private static int _peticionSequence;
+        private SemaphoreSlim _limiteConcurrencia;
+
+        /// <summary>
+        /// Constructor.
+        /// </summary>
+        public ServiceHost() : this(null) { }
+
+        public ServiceHost(string[] startupArgs)
+        {
+            _startupArgs = startupArgs;
+        }
+
+        /// <summary>
+        /// OnStart de contrato, usado para correr la Inicializacion y ParametrizacionesAsync.
+        /// Sin bloquear OnStart (no puede ser async por contrato).
+        /// </summary>
+        protected override void OnStart(string[] args)
+        {
+            //Ejecuta la inicialización...
+            _cts = new CancellationTokenSource();
+
+            string[] effectiveArgs = (args != null && args.Length > 0) ? args : _startupArgs;
+
+            Inicializacion(effectiveArgs, _cts.Token);
+            _startupTask = ParametrizacionesAsync(_cts.Token);
 
 
-        'Sender's Reference        
-        If objPACS008.pmtId.instrId <> "" Then
-            agrega_valor_xml(variables_XML, "sender_reference", objPACS008.pmtId.instrId)
-        End If
 
-        'Bank Operation Code
-        If objPACS008.pmtTpInfPrtry <> "" Then
-            agrega_valor_xml(variables_XML, "bank_op_code", objPACS008.pmtTpInfPrtry)
-        End If
+            _startupTask.ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                {
+                    var ex = t.Exception;
 
-        'Instruction Code
-        If objPACS008.instrForCdtrAgtCd <> "" Then
-            agrega_valor_xml(variables_XML, "instruction_code", objPACS008.instrForCdtrAgtCd)
-            agrega_valor_xml(variables_XML, "instruction_add_info", objPACS008.instrForCdtrAgtCd)
-        End If
+                    Log($"ERROR|OnStart|{ex}");
 
-        'Transaction Type Code
-        If objPACS008.purpPrtry <> "" Then
-            agrega_valor_xml(variables_XML, "trans_type_code", objPACS008.purpPrtry)
-        End If
+                    this.ExitCode = 1;
+                    this.Stop();
+                    return;
+                }
+            }, TaskScheduler.Default);
+        }
 
-        'Fecha Valor (Tendria que transformar a un formato que aun desconozco)
-        If objPACS008.intrBkSttlmDt <> "" Then
-            agrega_valor_xml(variables_XML, "settled_date", texto_to_fecha(objPACS008.intrBkSttlmDt))
-        End If
+        /// <summary>
+        /// Utiles para poder hacer debug en asyc.
+        /// </summary>
+#if DEBUG
+        public void DebugRun(string[] args)
+        {
+            OnStart(args);
+            Log("Servicio iniciado en modo DEBUG. Presiona ENTER para detener...");
+            Console.ReadLine();
+            OnStop();
+        }
+#endif
 
-        ' Moneda
-        If objPACS008.intrBkSttlmAmtCcy <> "" Then
-            lsCurrency = objPACS008.intrBkSttlmAmtCcy
-            agrega_valor_xml(variables_XML, "mensaje_moneda", lsCurrency) ' viene como propiedad la moneda
-            agrega_valor_xml(variables_XML, "settled_ccy", lsCurrency) ' viene como propiedad la moneda
-        End If
+        /// <summary>
+        /// Realiza la obtención de la configuración del servicio 
+        /// y la inyección de dependencias.
+        /// </summary>
+        protected void Inicializacion(string[] args, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            string proceso = (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
+                ? args[0]
+                : "Default";
 
-        ' Importe (Mandatory)
-        If objPACS008.intrBkSttlmAmt <> "" Then
-            agrega_valor_xml(variables_XML, "mensaje_importe", objPACS008.intrBkSttlmAmt)
-            agrega_valor_xml(variables_XML, "settled_amount", objPACS008.intrBkSttlmAmt)
-        Else
-            razonRechazo = "No se pudo leer el mensaje para establecer el importe."
-            Return False
-        End If
+            string NombreServicioConector = ObtenerNombreServicioConector(proceso);
+            string TipoServicio = NombreServicioConector.Replace("Conector_", "");
 
-        'Moneda Ordenado        
-        If objPACS008.instdAmtCcy <> "" Then
-            agrega_valor_xml(variables_XML, "instructed_ccy", objPACS008.instdAmtCcy)
-        End If
+            //Objeto que almacena la configuración necesaria para el funcionamiento del servicio...
+            _configuracionBase = new Configuracion();
 
-        ' Importe Ordenado
-        If objPACS008.instdAmt <> "" Then
-            agrega_valor_xml(variables_XML, "instructed_amount", objPACS008.instdAmt)
-        End If
+            //Inicializa la obtención de la configuración general y las rutas del log...
+            {
+                ConfiguracionEncriptadaHelper.Inicializar();
+                ServicioConfiguracionSettings servicioMainConfiguracion = ConfiguracionEncriptadaHelper.ObtenerServicio(NombreServicioConector);
+                _configuracionBase.NombreServicio = servicioMainConfiguracion.NombreServicio;
+                _configuracionBase.RutaArchivoConfiguracion = $@"{EnumRutasGenerales.Path_Log_CMS}\{NombreServicioConector}\";
+                _configuracionBase.PathLog = servicioMainConfiguracion.Log + servicioMainConfiguracion.NombreServicio;
+                _configuracionBase.configuracion = servicioMainConfiguracion.configuracion;
+                _configuracionBase.TamanoMaximoArchivoLogKB = servicioMainConfiguracion.TamanoMaximoArchivoLogKB.ToString();
+                _configuracionBase.ForzaEjecucionServicios = servicioMainConfiguracion.ForzaEjecucionServicios;
+                _configuracionBase.LimiteConcurrencia = servicioMainConfiguracion.LimiteConcurrencia;
+                _configuracionBase.AceptaDiferenciaEnFechas = servicioMainConfiguracion.AceptaDiferenciaEnFechas;
+                _configuracionBase.SwiftStandardReleaseSanitized = servicioMainConfiguracion.SwiftStandardReleaseSanitized;
 
-        'Tipo de Cambio
-        If objPACS008.xchgRate <> "" Then
-            agrega_valor_xml(variables_XML, "ex_rate", objPACS008.xchgRate)
-        End If
+                Logging.Init(_configuracionBase.PathLog, servicioMainConfiguracion.NombreServicio, servicioMainConfiguracion.TamanoMaximoArchivoLogKB);
+                LoggingConector.EscribirLog($"{ConstantesServicio.INFO}|El servicio atendera solicitudes '{TipoServicio}'.");
 
-        'Debtor Account 
-        If objPACS008.dbtr.acctIdOthrId <> "" Then
-            agrega_valor_xml(variables_XML, "ordering_account", objPACS008.dbtr.acctIdOthrId)
-        End If
-        
-        Dim settlementMethod As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/GrpHdr/SttlmInf/SttlmMtd")
-        If Not String.IsNullOrWhitespace(settlementMethod) Then
-            agrega_valor_xml(variables_XML, "settlement_method", settlementMethod)
-        End If
+            }
 
-        'Debtor Name
-        laMultivalorMX = New List(Of String)
-        laMultivalorMXAux = New List(Of String)
-        If objPACS008.dbtr.nm <> "" Then
-            agrega_valor_xml(variables_XML, "ordering_name", objPACS008.dbtr.nm)
-            laMultivalorMX = convierteTexto_a_Multivalor_SinCortar_Local(objPACS008.dbtr.nm, 35, totalLineasNameOrd)
+            //Realiza la configuracion del contenedor DI...
+            _containerDI = new SimpleInjector.Container();
+            _containerDI.Options.DefaultScopedLifestyle = new AsyncScopedLifestyle();
+            _containerDI.Register<IAlertas>(() => new Alertas(BasedatosProveedor.SqlServer, NombreBasedatos.TOMI, null, null), Lifestyle.Singleton);
+            _containerDI.Register<IControlServicio, ControlServicio>();
+            _containerDI.Register<MUFG_T24.Interfaces_utilidades.IParametrizacion, MUFG_T24.Inicializacion_utilidades.Parametrizacion>();
 
-            write_Log("INFO|interpreta_mensajes|totalLineasNameOrd =" & totalLineasNameOrd.ToString)
-            write_Log("INFO|interpreta_mensajes|laMultivalorMX.Count =" & laMultivalorMX.Count.ToString)
-            'Si el nombre rebasa las 2 lineas, mandamos al campo extra las lineas restantes
-            If (totalLineasNameOrd > 2) Then
-                laMultivalorMX = regresaNLineasDeMultivalor(laMultivalorMX, 2, laMultivalorMXAux)
-                If laMultivalorMXAux.Count > 0 Then
-                    'agregamos 
-                    agrega_valor_xml(variables_XML, "ordering_cust_nm_ext", Nothing, convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux), 65, totalLineasNameOrd))
-                End If
-            End If
-        End If
+            //Registra la configuracion...
+            _containerDI.Register<Configuracion>(() => _configuracionBase.Clone(), Lifestyle.Scoped);
+            //Registra los componentes del servicio...
+            _containerDI.Register<IRequestProcessor, RequestProcessor>(Lifestyle.Scoped);
 
-        'Debtor address
-        If Not objPACS008.dbtr.pstlAdr Is Nothing Then
-            totalLineasNameOrd = laMultivalorMX.Count
-            If objPACS008.dbtr.pstlAdr.adrLine.Count > 0 Then ' si existe AdrlLine es una dirección no Estructurada
+            _containerDI.Register<IHSMService, HSMService>(Lifestyle.Scoped);
+            _containerDI.Register<Func<IHSMService>>(() => () => _containerDI.GetInstance<IHSMService>(), Lifestyle.Scoped);
+            _containerDI.Register<IHsmClient, HsmTcpClient>(Lifestyle.Scoped);
+            _containerDI.Register<IHsmConfig, HsmConfig>(Lifestyle.Singleton);
+
+            _containerDI.Register<IRSASoapClient, RSASoapClient>(Lifestyle.Scoped);
+            _containerDI.Register<IRSAAdminService, RSAAdminService>(Lifestyle.Scoped);
+
+            _containerDI.Register<IRSATokenService, RSATokenService>(Lifestyle.Scoped);
+            _containerDI.Register<IRSAAuthenticationService, RSAAuthenticationService>(Lifestyle.Scoped);
+            _containerDI.Register<IRSASynchronizationService, RSASynchronizationService>(Lifestyle.Scoped);
+
+            _containerDI.Register<IRSAEncrypt, RSAUtilEncrypt>(Lifestyle.Scoped);
+            _containerDI.Register<IEncryptionService, TripleDesEncryptionService>(Lifestyle.Scoped);
+            _containerDI.Register<IRSAService, RSAService>(Lifestyle.Scoped);
+            _containerDI.Register<Func<IRSAService>>(() => () => _containerDI.GetInstance<IRSAService>(), Lifestyle.Scoped);
+
+            _containerDI.Verify();
+        }
+
+        /// <summary>
+        /// Realiza la obtención inicial de parámetros (una sola vez).
+        /// PENDIENTE: Poner parametrizaciones
+        /// </summary>
+        private async Task ParametrizacionesAsync(CancellationToken ct)
+        {
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+
+                //Marca el servicio en uso...
+                IParametrizacion _parametrizacion = _containerDI.GetInstance<IParametrizacion>();
+                _configuracionBase = await _parametrizacion.ObtenerProcesoActualAsync(_configuracionBase);
+                _configuracionBase.ParametrosSistema = await _parametrizacion.ObtenerParametrosSistemaAsync(ConstantesServicio.ParametrosSistema);
+
+                int limiteConcurrencia = _configuracionBase.LimiteConcurrencia ?? 5;
+                _limiteConcurrencia = new SemaphoreSlim(limiteConcurrencia, limiteConcurrencia);
+
+                IControlServicio _controlServicio = _containerDI.GetInstance<IControlServicio>();
+                await _controlServicio.MarcarPuertoEnUsoAsync(_configuracionBase.Pid.Value, _configuracionBase.NombreProceso, _configuracionBase.NombreDisplay, _configuracionBase.NombreServicio);
+
+                _configuracionBase.PuertoTCP = await _parametrizacion.ObtenerPuertos(_configuracionBase.NombreServicio, _configuracionBase.Pid.Value);
+
+                //Comienza el escuchador TCP...
+                _listenerTask = TcpListenerStartAsync(int.Parse(_configuracionBase.PuertoTCP), ct);
+
+                _ = _listenerTask.ContinueWith(t =>
+                {
+                    LoggingConector.EscribirLog($"ERROR|TcpListenerStartAsync|{t.Exception}");
+                    ExitCode = 1;
+                    Stop();
+                },
+                TaskContinuationOptions.OnlyOnFaulted);
+            }
+            catch (OperationCanceledException exc)
+            {
+                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeParametrizaciones}|{exc}");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeParametrizaciones}|{ex}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Establece el TCP listener.
+        /// </summary>
+        /// 
+        private async Task TcpListenerStartAsync(int puerto, CancellationToken token)
+        {
+            _tcpListener = new TcpListener(IPAddress.Any, puerto);
+            _tcpListener.Start();
+
+            Log($"Listener TCP activo en {IPAddress.Any}:{puerto}");
+
+            try
+            {
+                using (token.Register(() => { try { _tcpListener.Stop(); } catch { } }))
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        TcpClient client = null;
+                        try
+                        {
+                            client = await _tcpListener.AcceptTcpClientAsync().ConfigureAwait(false);
+                        }
+                        catch (SocketException ex) when (token.IsCancellationRequested)
+                        {
+                            Log($"ERROR|TcpListenerStartAsync|SocketException|{ex}");
+                        }
+                        catch (ObjectDisposedException) when (token.IsCancellationRequested) { break; }
+                        catch (Exception ex)
+                        {
+                            Log($"ERROR|TcpListenerStartAsync|{ex}");
+                            throw;
+                        }
+
+                        if (client == null)
+                        {
+                            continue;
+                        }
+
+                        var dispatcherTask = DispatcherAsync(client, token);
+                        await dispatcherTask.ContinueWith(t =>
+                        {
+                            if (t.IsFaulted)
+                            {
+                                Log($"ERROR|DispatcherAsync|{t.Exception}");
+                            }
+                        }, TaskScheduler.Default);
+                    }
+                }
+            }
+            finally
+            {
+                Log($"INFO|Termina Solicitud.");
+            }
+        }
+
+        /// <summary>
+        /// Manejador que controla la concurrencia para determinr si puede procesar una petición o agregarla a la cola.
+        /// </summary>
+        private async Task DispatcherAsync(TcpClient cliente, CancellationToken token)
+        {
+
+            await _limiteConcurrencia.WaitAsync(token);
+            try
+            {
+                await ProcesarClienteAsync(cliente, token);
+            }
+            finally
+            {
+                _limiteConcurrencia.Release();
+            }
+        }
+
+        /// <summary>
+        /// Interpreta la petición.
+        /// </summary>
+        private async Task ProcesarClienteAsync(TcpClient cliente, CancellationToken token)
+        {
+            using (cliente)
+            using (var stream = cliente.GetStream())
+            {
+                var remoteIp = ((IPEndPoint)cliente.Client.RemoteEndPoint).Address;
+                string clienteOrigen = remoteIp.ToString();
+
+                string contextoConector = null;
+
+                if (!ClientePermitido(clienteOrigen))
+                {
+                    Log($"INFO|{clienteOrigen}|ProcesarClienteAsync|La IP '{clienteOrigen}' no es valida para establecer conexión, será rechazada por la petición.");
+
+                    cliente.Close();
+                    return;
+                }
+
+                try
+                {
+                    string request = await LeerSolicitudTextoAsync(stream, token).ConfigureAwait(false);
+                    contextoConector = CrearContextoConector(clienteOrigen, request);
+
+                    using (LoggingConector.BeginContexto(contextoConector))
+                    {
+                        Log($"INFO|REQUEST|{clienteOrigen}|{request}");
+
+                        string response;
+
+                        using (AsyncScopedLifestyle.BeginScope(_containerDI))
+                        {
+                            var processor = _containerDI.GetInstance<IRequestProcessor>();
+
+                            response = await processor.ProcesarPeticionAsync(clienteOrigen, request);
+
+                        }
+
+                        Log($"INFO|RESPONSE|{clienteOrigen}|{response}");
+
+                        await EnviarRespuestaPlanoAsync(stream, response, token);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    using (LoggingConector.BeginContexto(contextoConector))
+                    {
+                        Log($"ERROR|ProcesarCliente|{clienteOrigen}|{ex}");
+                    }
+
+                    await EnviarRespuestaPlanoAsync(stream, "9", token);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Método para imprimir Log.
+        /// </summary>
+        /// <param name="mensaje"></param>
+        private void Log(string mensaje)
+        {
+            LoggingConector.EscribirLog(mensaje);
+            Console.WriteLine(mensaje);
+        }
+
+        /// <summary>
+        /// Crea un contexto único por petición del conector (logging especial del conector).
+        /// </summary>
+        private static string CrearContextoConector(string clienteOrigen, string solicitud)
+        {
+            int workerId = Interlocked.Increment(ref _workerSequence);
+            int peticionId = Interlocked.Increment(ref _peticionSequence);
+            string tipo = ObtenerTipoSolicitud(solicitud);
+            string origen = string.IsNullOrWhiteSpace(clienteOrigen) ? "N/A" : clienteOrigen.Trim();
+
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "[W:CNT-W{0:0000}][Peticion:CNT-P{1:0000}][Tipo:{2}][Cliente:{3}]",
+                workerId,
+                peticionId,
+                tipo,
+                origen);
+        }
+        /// <summary>
+        /// Método para obtener tipo de Solicitud.
+        /// </summary>
+        /// <param name="solicitud"></param>
+        /// <returns></returns>
+        private static string ObtenerTipoSolicitud(string solicitud)
+        {
+            if (string.IsNullOrWhiteSpace(solicitud) || solicitud.Length < 3)
+                return "N/A";
+
+            string tipo = solicitud.Substring(0, 3).Trim().ToUpperInvariant();
+            return tipo == ConstantesServicio.TIPO_SOLICITUD_RSA ||
+                   tipo == ConstantesServicio.TIPO_SOLICITUD_HSM ||
+                   tipo == ConstantesServicio.TIPO_SOLICITUD_SSO
+                ? tipo
+                : "N/A";
+        }
+        /// <summary>
+        /// Método para enviar respuesta
+        /// </summary>
+        /// <param name="stream"></param>
+        /// <param name="respuesta"></param>
+        /// <param name="ct"></param>
+        /// <returns></returns>
+        private async Task EnviarRespuestaPlanoAsync(NetworkStream stream, string respuesta, CancellationToken ct)
+        {
+            try
+            {
+                byte[] data = Encoding.ASCII.GetBytes(respuesta);
+                string length = data.Length.ToString().PadLeft(6, '0');
+
+                byte[] lengthBytes = Encoding.ASCII.GetBytes(length);
+
+                await stream.WriteAsync(lengthBytes, 0, lengthBytes.Length, ct).ConfigureAwait(false);
+                await stream.WriteAsync(data, 0, data.Length, ct).ConfigureAwait(false);
+                await stream.FlushAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR|EnviarRespuestaPlanoAsync|{ex}");
+            }
+        }
+
+        /// <summary>
+        /// Realiza ciertas operaciones antes de finalizar el servicio.
+        /// </summary>
+        private async Task TerminacionAsync(CancellationToken ct)
+        {
+            Log(ConstantesServicio.MensajeTerminacion);
+
+            try
+            {
+                //Espera los tasks que se esten ejecutando...
+                int max = _configuracionBase.LimiteConcurrencia ?? 5;
+                for (int i = 0; i < max; i++)
+                {
+                    bool obtenido = await _limiteConcurrencia.WaitAsync(TimeSpan.FromSeconds(20), ct);
+
+                    if (!obtenido)
+                    {
+                        Log("WAR|Timeout esperando peticiones activas.");
+                        break;
+                    }
+                }
+
+                using (AsyncScopedLifestyle.BeginScope(_containerDI))
+                {
+                    Configuracion _configuracion = _containerDI.GetInstance<Configuracion>();
+                    IControlServicio _controlServicio = _containerDI.GetInstance<IControlServicio>();
+
+                    await _controlServicio.MarcarPuertoEnUsoAsync(null, null, null, _configuracion.NombreServicio);
+                    await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio);
+                }
+
+                LoggingConector.EscribirLog(ConstantesServicio.MensajeTerminacionExitosa);
+            }
+            catch (OperationCanceledException exc)
+            {
+                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeOperationCanceledException}|{exc}");
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeException}|{ex}");
+            }
+        }
+
+
+
+
+        /// <summary>
+        /// Método para obtener el nombre del servicio conector
+        /// </summary>
+        /// <param name="proceso"></param>
+        /// <returns></returns>
+        /// <exception cref="ArgumentException"></exception>
+        private static string ObtenerNombreServicioConector(string proceso)
+        {
+            if (string.IsNullOrWhiteSpace(proceso))
+            {
+                throw new ArgumentException(nameof(proceso));
+            }
+
+            switch (proceso.Trim().ToUpperInvariant())
+            {
+                case ConstantesServicio.PROCESO_HSM:
+                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_HSM;
+                case ConstantesServicio.PROCESO_RSA_ADMIN:
+                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_RSA_ADMIN;
+                case ConstantesServicio.PROCESO_RSA_AUTH:
+                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_RSA_AUTH;
+                case ConstantesServicio.PROCESO_RSA_SYNC:
+                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_RSA_SYNC;
+
+                default:
+                    throw new ArgumentException($"Proceso no soportado: {proceso}", nameof(proceso));
+            }
+        }
+
+        /// <summary>
+        /// Método para validar cliente permitido
+        /// </summary>
+        /// <param name="direccionCliente"></param>
+        /// <param name="clienteOrigen"></param>
+        /// <returns></returns>
+        private bool ClientePermitido(string direccionCliente)
+        {
+            string ListaDirecciones = ObtenerValor(ConstantesServicio.CONECTORCLIENTES, x => x);
+            if (string.IsNullOrWhiteSpace(direccionCliente))
+            {
+                return false;
+            }
+            if (!IPAddress.TryParse(direccionCliente, out _))
+            {
+                return false;
+            }
+            return ($",{ListaDirecciones},").Contains($",{direccionCliente},");
+        }
+
+        /// <summary>
+        /// Metodo para obtener valor de parametros de configuracion de MQ.
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="clave"></param>
+        /// <param name="parser"></param>
+        /// <param name="defaultValue"></param>
+        /// <returns></returns>
+        T ObtenerValor<T>(string clave, Func<string, T> parser, T defaultValue = default)
+        {
+            if (_configuracionBase.ParametrosSistema.TryGetValue(clave, out var valor))
+                return parser(valor);
+
+            LoggingConector.EscribirLog($"INFO|ObtenerValor|Clave no encontrada en BD: {clave}");
+            return defaultValue;
+        }
+
+        protected async Task<byte[]> ReadExactAsync(NetworkStream stream, int length, CancellationToken ct)
+        {
+            try
+            {
+                byte[] buffer = new byte[length];
+                int read;
+                for (int offset = 0; offset < length; offset += read)
+                {
+                    read = await stream.ReadAsync(buffer, offset, length - offset, ct).ConfigureAwait(continueOnCapturedContext: false);
+                    if (read == 0)
+                    {
+                        throw new IOException("Cliente cerró la conexión");
+                    }
+                }
+
+                return buffer;
+            }
+            catch (Exception ex)
+            {
+                throw new IOException("Error durante la recepción de datos desde el socket.", ex);
+            }
+
+        }
+
+        /// <summary>
+        /// OnStop de contrato, usado para correr TerminacionAsync en async.
+        /// Sin bloquear OnStop (no puede ser async por contrato).
+        /// </summary>
+        protected override void OnStop()
+        {
+            try
+            {
+                //Señaliza cancelación...
+                _tcpListener?.Stop();
+                _cts?.Cancel();
+
+                if (_listenerTask != null)
+                {
+                    Task.WaitAny(_listenerTask, Task.Delay(5000));
+                }
+
+                //Ejecuta la terminacíón...
+                CancellationToken token = _cts?.Token ?? CancellationToken.None;
+                Task.WaitAny(TerminacionAsync(token), Task.Delay(TimeSpan.FromSeconds(25)));
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR|OnStop|{ex}");
+            }
+            finally
+            {
+                _limiteConcurrencia?.Dispose();
+                _cts?.Dispose();
+            }
+
+        }
+
+        public static int ParseEnteroRequerido(string valor, string nombreCampo)
+        {
+            if (string.IsNullOrWhiteSpace(valor))
+            {
+                throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' porque viene vacío.");
+            }
+
+            if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result))
+            {
+                return result;
+            }
+
+            throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' con valor '" + valor + "' a Int32.");
+        }
+
+        private async Task<string> LeerSolicitudTextoAsync(NetworkStream stream, CancellationToken ct)
+        {
+            byte[] buffer = new byte[4096];
+
+            using (var ms = new MemoryStream())
+            {
+                while (true)
+                {
+                    int read = await stream.ReadAsync(buffer, 0, buffer.Length, ct).ConfigureAwait(false);
+
+                    if (read == 0)
+                    {
+                        if (ms.Length == 0)
+                        {
+                            throw new IOException("Cliente cerró la conexión");
+                        }
+
+                        break;
+                    }
+
+                    ms.Write(buffer, 0, read);
+
+                    if (!stream.DataAvailable)
+                    {
+                        await Task.Delay(10, ct).ConfigureAwait(false);
+
+                        if (!stream.DataAvailable)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                string solicitud = Encoding.ASCII.GetString(ms.ToArray());
+                return solicitud.TrimEnd('\0', '\r', '\n');
+            }
+        }
+    }
+}
+
+using AplicacionConector.DTOs;
+using AplicacionConector.Enums;
+using AplicacionConector.Interfaces;
+using AplicacionConector.Utilidades;
+using MUFG_T24.Comunes;
+using System;
+using System.Net.Sockets;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Xml;
+
+namespace InfraestructuraConector.SOAP
+{
+    /// <summary>
+    /// Clase para sincronización de servicio RSA.
+    /// </summary>
+    public class RSASynchronizationService
+        : IRSASynchronizationService
+    {
+        private readonly IRSASoapClient _rsaClient;
+        private readonly IRSATokenService _tokenService;
+        /// <summary>
+        /// Constructor
+        /// </summary>
+        /// <param name="rsaClient"></param>
+        /// <param name="tokenService"></param>
+        public RSASynchronizationService(IRSASoapClient rsaClient,IRSATokenService tokenService)
+        {
+            _rsaClient = rsaClient;
+            _tokenService = tokenService;
+        }
+        /// <summary>
+        /// Método para sincronizar token RSA.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="tokenSn"></param>
+        /// <param name="tokenCode1"></param>
+        /// <param name="tokenCode2"></param>
+        /// <returns></returns>
+        public async Task<EstatusRegreso> SincronizarAsync(string clienteOrigen,string tokenSn,string tokenCode1,string tokenCode2)
+        {
+            try
+            {
+                TokenUserInfo tokenInfo = await _tokenService.ObtenerInformacionTokenAsync(clienteOrigen, tokenSn);
+
+                if (tokenInfo == null)
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSASynchronizationService|El TokenUserInfo es nullo .");
+                    return EstatusRegreso.ErrorGeneral;
+                }
+
+                if (tokenInfo.Estatus != EstatusRegreso.OK)
+                    return tokenInfo.Estatus;
+
+                if (string.IsNullOrWhiteSpace(tokenInfo.UserId))
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSASynchronizationService|El token[{tokenSn}] no está asociado a ningun usuario.");
+                    return EstatusRegreso.ErrorGeneral;
+                }
+
+                if (!tokenInfo.Enabled)
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSAAuthenticationService|Token deshabilitado.");
+                    return EstatusRegreso.AccesoDenegado;
+                }
+
+                if (!tokenInfo.UserEnabled)
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSAAuthenticationService|Usuario deshabilitado.");
+                    return EstatusRegreso.AccesoDenegado;
+                }
+
+                if (tokenInfo.UserLocked)
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSAAuthenticationService|Usuario bloqueado.");
+                    return EstatusRegreso.AccesoDenegado;
+                }
+
+                if (tokenCode2 == "0") 
+                    return EstatusRegreso.OK;                
+
+                string xml = RSAXmlBuilder.BuildResync(tokenSn,tokenCode1,tokenCode2);
+
+                string response = _rsaClient.Resync(xml);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.RSASynchronizationService|Token='{tokenCode1}'. Se recibe respuesta del WS=" + XMLToTexto(response ?? string.Empty));
+
+                string lsTrnResCode = string.Empty;
+                string lsTrnResMsg = string.Empty;
+                string valorMSG = string.Empty;
+
+                return EsValidoAnalisXml(ref response, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG) ? EstatusRegreso.OK : EstatusRegreso.ErrorGeneral;
                 
-                lsNodoXML = Join(objPACS008.dbtr.pstlAdr.adrLine, " ")
-                write_Log("INFO|interpreta_mensajes|Direccion Completa =" & lsNodoXML)
+            }
+            catch (TimeoutException ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|TIMEOUT_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
+
+                return EstatusRegreso.ErrorGeneral;
+            }
+            catch (XmlException ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|PROTOCOL_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
+
+                return EstatusRegreso.ErrorGeneral;
+            }
+            catch (SocketException ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|DEPENDENCY_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
+
+                return EstatusRegreso.ErrorGeneral;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|UNEXPECTED_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
+
+                return EstatusRegreso.ErrorGeneral;
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="textoXML"></param>
+        /// <returns></returns>
+        private string XMLToTexto(string textoXML)
+        {
+            return Regex.Replace(
+                textoXML
+                .Replace("\r\n", "")
+                .Replace("\r", "")
+                .Replace("\n", "")
+                .Replace("\t", ""),
+                " {2,}",
+                " ");
+        }
+
+        /// <summary>
+        /// Método para validación de formato XML.
+        /// </summary>
+        /// <param name="textXML"></param>
+        /// <param name="trnResCode"></param>
+        /// <param name="trnResMsg"></param>
+        /// <param name="valorMSG"></param>
+        /// <returns></returns>
+        private bool EsValidoAnalisXml(ref string textXML, ref string trnResCode, ref string trnResMsg, ref string valorMSG)
+        {
+            XmlElement loXMLElement;
+            XmlElement loXMLSubElement;
+
+            XmlDocument loXMLDoc;
+            string error;
+
+            if (!XmlHelper.TryParseXmlSeguro(textXML, out loXMLDoc, out error))
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                LoggingConector.EscribirLog($"ERROR|RSASynchronizationService|XML inválido: {error}");
+                return false;
+            }
+
+            loXMLElement = loXMLDoc["SERVICE_RESPONSE"];
+
+            if (loXMLElement == null)
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            loXMLElement = loXMLElement["TRANSACTION_RESPONSE"];
+
+            if (loXMLElement == null)
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            trnResCode = loXMLElement.Attributes?["trnResCode"]?.Value;
+            trnResMsg = loXMLElement.Attributes?["trnResMsg"]?.Value;
+
+            if (string.IsNullOrWhiteSpace(trnResCode) || string.IsNullOrWhiteSpace(trnResMsg))
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            if (trnResCode == "0" && trnResMsg == "Success")
+            {
+                loXMLElement = loXMLElement["TOKEN_ADMIN_RESPONSE"];
+
+                if (loXMLElement == null)
+                    return false;
+
+                loXMLSubElement = loXMLElement["STATUS"];
+
+                if (loXMLSubElement == null)
+                    return false;
+
+                if (loXMLSubElement.InnerText == "0")
+                {
+                    loXMLSubElement = loXMLElement["MSG"];
+
+                    if (loXMLSubElement != null)
+                    {
+                        valorMSG = loXMLSubElement.InnerText;
+                    }
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }
+    }
+}
+
+using AplicacionConector.DTOs;
+using AplicacionConector.Enums;
+using AplicacionConector.Interfaces;
+using AplicacionConector.Utilidades;
+using MUFG_T24.Comunes;
+using System;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Xml;
+
+namespace InfraestructuraConector.SOAP
+{
+    /// <summary>
+    /// Clase para implementar métodos Token.
+    /// </summary>
+    public class RSATokenService : IRSATokenService
+    {
+        private readonly IRSASoapClient _rsaClient;
+        private readonly IRSAEncrypt _rsaEncript;
+        /// <summary>
+        /// Constructor Token
+        /// </summary>
+        /// <param name="rsaClient"></param>
+        /// <param name="rsaEncript"></param>
+        public RSATokenService(IRSASoapClient rsaClient, IRSAEncrypt rsaEncript)
+        {
+            _rsaClient = rsaClient;
+            _rsaEncript = rsaEncript;
+        }
+        /// <summary>
+        /// Método para obtener Información Token.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="tokenSn"></param>
+        /// <returns></returns>
+        public async Task<TokenUserInfo> ObtenerInformacionTokenAsync(string clienteOrigen, string tokenSn)
+        {
+            string lsEntrada = string.Empty;
+            string lsRegreso = string.Empty;
+            string lsTrnResCode = string.Empty;
+            string lsTrnResMsg = string.Empty;
+            string valorMSG = string.Empty;
+            var tokenInfo = new TokenUserInfo();
+
+            try
+            {
+                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
+                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
+                lsRegreso = _rsaClient.TokenInfo(lsEntrada);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.obtener_info_tokenUser|Al buscar propiedades del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso));
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    tokenInfo.Estatus = lsTrnResCode == ConstantesServicio.TokenInexistenteCode ? EstatusRegreso.TokenInexistente : EstatusRegreso.ErrorGeneral;
+                    return tokenInfo;
+                }
+
+                string[] datos = valorMSG.Split('/');
+
+                tokenInfo.Estatus = EstatusRegreso.OK;
+                tokenInfo.TokenSerialNumber = tokenSn;
+                tokenInfo.Active = true;
+
+                if (datos.Length > 0)
+                    tokenInfo.Enabled = datos[0] == "1";
+
+                if (datos.Length > 1)
+                    tokenInfo.PinMode = datos[1] == "1";
+
+                if (datos.Length > 2)
+                    tokenInfo.NextTokenCode = datos[2] == "1";
+
+                if (datos.Length > 3)
+                    tokenInfo.UserId = datos[3];
+
+                if (string.IsNullOrWhiteSpace(tokenInfo.UserId))
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.obtener_info_tokenUser|El token='{tokenSn}' no está asociado a ningún usuario.");
+                    return tokenInfo;
+                }
+
+                string UsuarioIDEncript = _rsaEncript.Encrypt(tokenInfo.UserId);
+                lsEntrada = GenerarXmlTokenAdmin(UsuarioIDEncript, string.Empty, string.Empty, string.Empty);
+                lsRegreso = _rsaClient.GetUserInfo(lsEntrada);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.obtener_info_tokenUser|Al buscar propiedades del ususario='{tokenInfo.UserId}'. Se reciberespuesta WS={XMLToTexto(lsRegreso)}");
+
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                if (EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    datos = valorMSG.Split('/');
+                    if (datos.Length > 0)
+                        tokenInfo.UserName = datos[0];
+
+                    if (datos.Length > 1)
+                        tokenInfo.UserEnabled = datos[1] == "1";
+
+                    if (datos.Length > 2)
+                        tokenInfo.UserLocked = datos[2] == "1";
+                }
+                else {
+                    LoggingConector.EscribirLog($"WARN|{clienteOrigen}|RSA.obtener_info_tokenUser|No fue posible obtener la información del usuario. Código={lsTrnResCode}");
+                    tokenInfo.Estatus = EstatusRegreso.ErrorGeneral;
+                }
+
+                return tokenInfo;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.obtener_info_tokenUser|{ex}");
+                tokenInfo.Estatus = EstatusRegreso.ErrorGeneral;
+
+                return tokenInfo;
+            }
+        }
+
+        #region ValidacionXml
+        /// <summary>
+        /// Método para validar XML.
+        /// </summary>
+        /// <param name="textXML"></param>
+        /// <param name="trnResCode"></param>
+        /// <param name="trnResMsg"></param>
+        /// <param name="valorMSG"></param>
+        /// <returns></returns>
+        private bool EsValidoAnalisXml(ref string textXML, ref string trnResCode, ref string trnResMsg, ref string valorMSG)
+        {
+            XmlElement loXMLElement;
+            XmlElement loXMLSubElement;
+
+            XmlDocument loXMLDoc;
+            string error;
+
+            if (!XmlHelper.TryParseXmlSeguro(textXML, out loXMLDoc, out error))
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                LoggingConector.EscribirLog($"ERROR|RSATokenService|XML inválido: {error}");
+                return false;
+            }
+
+            loXMLElement = loXMLDoc["SERVICE_RESPONSE"];
+
+            if (loXMLElement == null)
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            loXMLElement = loXMLElement["TRANSACTION_RESPONSE"];
+
+            if (loXMLElement == null)
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            trnResCode = loXMLElement.Attributes?["trnResCode"]?.Value;
+            trnResMsg = loXMLElement.Attributes?["trnResMsg"]?.Value;
+
+            if (string.IsNullOrWhiteSpace(trnResCode) || string.IsNullOrWhiteSpace(trnResMsg))
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            if (trnResCode == "0" && trnResMsg == "Success")
+            {
+                loXMLElement = loXMLElement["TOKEN_ADMIN_RESPONSE"];
+
+                if (loXMLElement == null)
+                    return false;
+
+                loXMLSubElement = loXMLElement["STATUS"];
+
+                if (loXMLSubElement == null)
+                    return false;
+
+                if (loXMLSubElement.InnerText == "0")
+                {
+                    loXMLSubElement = loXMLElement["MSG"];
+
+                    if (loXMLSubElement != null)
+                    {
+                        valorMSG = loXMLSubElement.InnerText;
+                    }
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }
+        /// <summary>
+        /// Validación de XML a Texto.
+        /// </summary>
+        /// <param name="textoXML"></param>
+        /// <returns></returns>
+        private string XMLToTexto(string textoXML)
+        {
+            return Regex.Replace(
+                textoXML
+                .Replace("\r\n", "")
+                .Replace("\r", "")
+                .Replace("\n", "")
+                .Replace("\t", ""),
+                " {2,}",
+                " ");
+        }
+
+        #endregion
+
+        /// <summary>
+        /// Método para estructura general de XML Token.
+        /// </summary>
+        /// <param name="usuarioId"></param>
+        /// <param name="serialNumber"></param>
+        /// <param name="firstToken"></param>
+        /// <param name="secondToken"></param>
+        /// <returns></returns>
+        private string GenerarXmlTokenAdmin(string usuarioId, string serialNumber, string firstToken, string secondToken)
+        {
+            return $@"<SERVICE>
+                    <TRANSACTION>
+                    <TOKEN_ADMIN>
+                    <CUST_USER_ID>{usuarioId}</CUST_USER_ID>
+                    <SERIAL_NUMBER>{serialNumber}</SERIAL_NUMBER>
+                    <FIRST_TOKEN>{firstToken}</FIRST_TOKEN>
+                    <SECOND_TOKEN>{secondToken}</SECOND_TOKEN>
+                    </TOKEN_ADMIN>
+                    </TRANSACTION>
+                    </SERVICE>";
+        }
+
+    }
+}
+
+
+using AplicacionConector.Enums;
+using AplicacionConector.Interfaces;
+using AplicacionConector.Utilidades;
+using MUFG_T24.Comunes;
+using System;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Xml;
+
+namespace InfraestructuraConector.SOAP
+{
+    /// <summary>
+    /// Clase para implementar métodos admistrativos de RSA.
+    /// </summary>
+    public class RSAAdminService : IRSAAdminService
+    {
+        private readonly IRSASoapClient _rsaClient;
+        private readonly IRSAAuthenticationService _authService;
+        private readonly IRSATokenService _tokenService;
+        private readonly IRSAEncrypt _rsaEncript;
+
+        /// <summary>
+        /// Constructor principal
+        /// </summary>
+        /// <param name="rsaClient"></param>
+        /// <param name="authService"></param>
+        /// <param name="tokenService"></param>
+        /// <param name="rsaEncript"></param>
+        public RSAAdminService(IRSASoapClient rsaClient, IRSAAuthenticationService authService, IRSATokenService tokenService, IRSAEncrypt rsaEncript)
+        {
+            _rsaClient = rsaClient;
+            _authService = authService;
+            _tokenService = tokenService;
+            _rsaEncript = rsaEncript;
+        }
+        /// <summary>
+        /// Método para obtener información de Token.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="tokenSn"></param>
+        /// <returns></returns>
+        public async Task<string> InformacionTokenAsync(string clienteOrigen, string tokenSn)
+        {
+
+            var token = await _tokenService.ObtenerInformacionTokenAsync(clienteOrigen, tokenSn);
+
+            if (token == null)
+                return "-1";
+
+            if (token.Estatus != EstatusRegreso.OK)
+                return ((int)token.Estatus).ToString();
+
+            return string.Join("|",
+                "0",
+                $"Activo={(token.Active ? 1 : 0)}",
+                $"Estado={(token.Enabled ? 1 : 0)}",
+                $"PinMode={(token.PinMode ? 1 : 0)}",
+                $"NextTokenCode={(token.NextTokenCode ? 1 : 0)}",
+                $"UsuarioID={token.UserId}",
+                $"UsuarioNombre={token.UserName}",
+                $"UsuarioEnabled={(token.UserEnabled ? 1 : 0)}",
+                $"UsuarioLocked={(token.UserLocked ? 1 : 0)}");
+        }
+        /// <summary>
+        /// Método para habilitar Token 
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="operadorUsuario"></param>
+        /// <param name="operadorTokenSn"></param>
+        /// <param name="operadorTokenCode"></param>
+        /// <param name="tokenSn"></param>
+        /// <returns></returns>
+        public async Task<EstatusRegreso> HabilitaTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode, string tokenSn)
+        {
+            try
+            {
+                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.habilitaToken_WS|Por validar las credenciales del Operador.");
+                if (auth != EstatusRegreso.OK)
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|Falló la validación de las credenciales del Operador.");
+                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
+                }
+                string token = _rsaEncript.Encrypt(tokenSn);
+                string lsEntrada = GenerarXmlTokenAdmin(string.Empty, token, string.Empty, string.Empty);
+
+                string lsRegreso = _rsaClient.EnableToken(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.habilitaToken_WS|Al habilitar token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                string lsTrnResCode = string.Empty;
+                string lsTrnResMsg = string.Empty;
+                string valorMSG = string.Empty;
+                bool respuestaValida = EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG);
+
+                if (!respuestaValida)
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                    {
+                        LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|Token inexistente='{tokenSn}'");
+                        return EstatusRegreso.TokenInexistente;
+                    }
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|Error al habilitar token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.habilitaToken_WS|Token='{tokenSn}' habilitado correctamente.");
+                return EstatusRegreso.OK;
+
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|{ex}");
+                return EstatusRegreso.ErrorGeneral;
+            }
+        }
+
+        #region AltaUsuarioTokenAsync
+        /// <summary>
+        /// Método para obtener alta de usuario Token.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="operadorUsuario"></param>
+        /// <param name="operadorTokenSn"></param>
+        /// <param name="operadorTokenCode"></param>
+        /// <param name="usuarioId"></param>
+        /// <param name="nombre"></param>
+        /// <param name="apellido"></param>
+        /// <param name="tokenSn"></param>
+        /// <returns></returns>
+        public async Task<EstatusRegreso> AltaUsuarioTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode,
+            string usuarioId, string nombre, string apellido, string tokenSn)
+        {
+            string lsEntrada = string.Empty;
+            string lsRegreso = string.Empty;
+            string lsTrnResCode = string.Empty;
+            string lsTrnResMsg = string.Empty;
+            string valorMSG = string.Empty;
+
+            try
+            {
+                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Por validar las credenciales del Operador.");
+                if (auth != EstatusRegreso.OK)
+                {
+                    LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Falló la validación de las credenciales del Operador.");
+                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
+                }
+                string UsuarioIdEncript = _rsaEncript.Encrypt(usuarioId.ToUpper());
+                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
+                #region Crear Usuario
+                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, string.Empty, nombre, apellido);
+                lsRegreso = _rsaClient.AddUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|A crear el usuario, id='{usuarioId}', nombre='{nombre}', apellido='{apellido}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Error crear el usuario, Codigo='{lsTrnResCode}', Mensaje='{lsTrnResMsg}'");
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Usuario creado correctamente.");
+
+                #endregion
+
+                #region Asociar Token
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenSnEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.LinkTokenToUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|A asociar, id='{usuarioId}' al token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                    {
+                        return EstatusRegreso.TokenInexistente;
+                    }
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Error al asociar token. Codigo='{lsTrnResCode}', Mensaje='{lsTrnResMsg}'");
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Token asociado correctamente.");
+                #endregion
+
+                #region Deshabilitar Token
+
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
+                lsRegreso = _rsaClient.DisableToken(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|A deshabiliar el token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                    {
+                        return EstatusRegreso.TokenInexistente;
+                    }
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Error al deshabilitar token. Codigo='{lsTrnResCode}', Mensaje='{lsTrnResMsg}'");
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Proceso exitoso.");
+                #endregion
+
+                return EstatusRegreso.OK;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|{ex}");
+                return EstatusRegreso.ErrorGeneral;
+            }
+        }
+        #endregion
+
+        #region ReposicionTokenAsync
+        /// <summary>
+        /// Método para obtener reposición Token.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="operadorUsuario"></param>
+        /// <param name="operadorTokenSn"></param>
+        /// <param name="operadorTokenCode"></param>
+        /// <param name="usuarioId"></param>
+        /// <param name="tokenAnterior"></param>
+        /// <param name="tokenNuevo"></param>
+        /// <returns></returns>
+        public async Task<EstatusRegreso> ReposicionTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode,
+            string usuarioId, string tokenAnterior, string tokenNuevo)
+        {
+            string lsEntrada = string.Empty;
+            string lsRegreso = string.Empty;
+            string lsTrnResCode = string.Empty;
+            string lsTrnResMsg = string.Empty;
+            string valorMSG = string.Empty;
+
+            try
+            {
+                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Por validar las credenciales del Operador.");
+                if (auth != EstatusRegreso.OK)
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Falló la validación de las credenciales del Operador.");
+                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
+                }
+
+                string UsuarioIdEncript = _rsaEncript.Encrypt(usuarioId);
+                string tokenAnteriorEncript = _rsaEncript.Encrypt(tokenAnterior);
+                string tokenNuevoEncript = _rsaEncript.Encrypt(tokenNuevo);
+                string operadorTokenSnEncript = _rsaEncript.Encrypt(operadorTokenSn);                
+
+                #region Desasociar Token Anterior
+
+                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenAnteriorEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.UnAssignToken(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al desasociar el usuario '{usuarioId}' del token='{tokenAnterior}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al desasociar token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Token anterior desasociado correctamente.");
+
+                #endregion
+
+                #region Deshabilitar Token Anterior
+
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenAnteriorEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.DisableToken(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al deshabilidar el token='{tokenAnterior}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al deshabilitar token anterior. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Token anterior deshabilitado correctamente.");
+
+                #endregion
+
+                #region Asociar nuevo Token
+
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenNuevoEncript, string.Empty, string.Empty);
+                lsRegreso = _rsaClient.LinkTokenToUser(lsEntrada);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al asociar el usuario '{tokenAnterior}' del token='{tokenNuevo}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al asociar nuevo token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Nuevo token asociado correctamente.");
+
+                #endregion
+
+                #region Deshabilitar nuevo token
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenNuevoEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.DisableToken(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al deshabilidar el token='{tokenNuevo}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al deshabilitar nuevo token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Nuevo token deshabilitado correctamente.");
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Proceso exitoso.");
+                #endregion
+
+                return EstatusRegreso.OK;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|{ex}");
+                return EstatusRegreso.ErrorGeneral;
+            }
+        }
+        #endregion
+
+        #region TraspasoTokenAsync
+        /// <summary>
+        /// Método para obtener Transpaso de Token.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="operadorUsuario"></param>
+        /// <param name="operadorTokenSn"></param>
+        /// <param name="operadorTokenCode"></param>
+        /// <param name="usuarioAnterior"></param>
+        /// <param name="usuarioNuevo"></param>
+        /// <param name="nombreNuevo"></param>
+        /// <param name="apellidoNuevo"></param>
+        /// <param name="tokenSn"></param>
+        /// <returns></returns>
+        public async Task<EstatusRegreso> TraspasoTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn,
+            string operadorTokenCode, string usuarioAnterior, string usuarioNuevo, string nombreNuevo, string apellidoNuevo, string tokenSn)
+        {
+            string lsEntrada = string.Empty;
+            string lsRegreso = string.Empty;
+            string lsTrnResCode = string.Empty;
+            string lsTrnResMsg = string.Empty;
+            string valorMSG = string.Empty;
+            try
+            {
+                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Por validar las credenciales del Operador.");
+                if (auth != EstatusRegreso.OK)
+                {
+                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.traspaso_token|Falló la validación de las credenciales del Operador.");
+                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
+                }
+                usuarioNuevo = usuarioNuevo.ToLowerInvariant();
+                nombreNuevo = nombreNuevo.ToLowerInvariant();
+                apellidoNuevo = apellidoNuevo.ToLowerInvariant();
+
+                string usuarioNuevoEncript = _rsaEncript.Encrypt(usuarioNuevo);
+                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
+                string usuarioAnteriorEncript = _rsaEncript.Encrypt(usuarioAnterior);
                 
-                ' Hybrid
-                If objPACS008.dbtr.pstlAdr.ctry <> "" Then
-                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.dbtr.pstlAdr.ctry)
-                End If
-                ' TownName debe ser requerido
-                If objPACS008.dbtr.pstlAdr.twnNm <> "" Then
-                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.dbtr.pstlAdr.twnNm)
-                End If
-                
-                ' Separamos en lineas de 35
-                laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsNodoXML, 35, totalLineasDir)
-                write_Log("INFO|interpreta_mensajes|Lineas de la direccion del ordenate =" & laMultivalorMXAux.Count.ToString)
-            Else ' Es una dirección Estructurada leemos cada tag    
-                If objPACS008.dbtr.pstlAdr.strtNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.strtNm)
-                End If
-                If objPACS008.dbtr.pstlAdr.bldgNb <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.bldgNb)
-                End If
-                If objPACS008.dbtr.pstlAdr.bldgNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.bldgNm)
-                End If
-                If objPACS008.dbtr.pstlAdr.flr <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.flr)
-                End If
-                If objPACS008.dbtr.pstlAdr.pstBx <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.pstBx)
-                End If
-                If objPACS008.dbtr.pstlAdr.room <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.room)
-                End If
-                If objPACS008.dbtr.pstlAdr.dept <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.dept)
-                End If
-                If objPACS008.dbtr.pstlAdr.subDept <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.subDept)
-                End If
-                'Country debe ser requerido ++++++ OJO AQUI ++++++
-                If objPACS008.dbtr.pstlAdr.ctry <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.ctry)
-                End If
-                ' TownName debe ser requerido
-                If objPACS008.dbtr.pstlAdr.twnNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.twnNm)
-                End If
-                If objPACS008.dbtr.pstlAdr.pstCd <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.pstCd)
-                End If
-                If objPACS008.dbtr.pstlAdr.ctrySubDvsn <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.ctrySubDvsn)
-                End If
-                If objPACS008.dbtr.pstlAdr.twnLctnNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.twnLctnNm)
-                End If
-                If objPACS008.dbtr.pstlAdr.dstrctNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.dbtr.pstlAdr.dstrctNm)
-                End If
-                If lsDireccionConcat <> "" Then
-                    laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsDireccionConcat, 35, totalLineasDir)
-                End If
-            End If
+                #region Crear Usuario nuevo
+                lsEntrada = GenerarXmlTokenAdmin(usuarioNuevoEncript, string.Empty, nombreNuevo.ToLower(), apellidoNuevo.ToUpper());
 
-            ' Agregamos al array principal la o las lineas que quepan referente a la direccion
-            If laMultivalorMX.Count = 2 Then
-                write_Log("INFO|interpreta_mensajes|Array principal con 2 o mas lineas =" & laMultivalorMX.Count.ToString)
-                laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 1))
-            ElseIf laMultivalorMX.Count = 1 Then
-                write_Log("INFO|interpreta_mensajes|Array principal con 1 o menos lineas =" & laMultivalorMX.Count.ToString)
-                If laMultivalorMXAux.Count = 1 Then
-                    laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 1))
-                Else
-                    laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 2))
-                End If
-            End If
+                lsRegreso = _rsaClient.AddUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Al crear el usuario, id='{usuarioNuevo}', nombre='{nombreNuevo}', apellido='{apellidoNuevo}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Usuario creado correctamente.");
+                #endregion
+
+                #region Desasociar Usuario Anterior
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(usuarioAnteriorEncript, tokenSnEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.UnLinkTokenToUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Al desasociar usuario='{usuarioNuevo}' del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Usuario anterior desasociado correctamente.");
+                #endregion             
+
+                #region Asociar Nuevo Usuario al Token
+
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(usuarioNuevoEncript, tokenSnEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.LinkTokenToUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al asociar usuario='{usuarioAnterior}' del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Nuevo usuario asociado correctamente.");
+
+                #endregion
+
+                #region Eliminar Usuario Anterior
+
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+                lsEntrada = GenerarXmlTokenAdmin(usuarioAnteriorEncript, string.Empty, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.DeleteUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Al dar de baja al usuario='{usuarioAnterior}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Usuario anterior eliminado correctamente.");
+
+                #endregion
+
+                #region Deshabilitar Token
+
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.DisableToken(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al deshabilidar el token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Proceso exitoso.");
+
+                #endregion
+
+                return EstatusRegreso.OK;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|{ex}");
+                return EstatusRegreso.ErrorGeneral;
+            }
+        }
+
+        #endregion
+
+        #region BajaUsuarioTokenAsync
+        /// <summary>
+        /// Método para realizar la Baja de un usuario token.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="operadorUsuario"></param>
+        /// <param name="operadorTokenSn"></param>
+        /// <param name="operadorTokenCode"></param>
+        /// <param name="usuarioId"></param>
+        /// <param name="tokenSn"></param>
+        /// <returns></returns>
+        public async Task<EstatusRegreso> BajaUsuarioTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode, string usuarioId, string tokenSn)
+        {
+            string lsEntrada = string.Empty;
+            string lsRegreso = string.Empty;
+            string lsTrnResCode = string.Empty;
+            string lsTrnResMsg = string.Empty;
+            string valorMSG = string.Empty;
+
+            try
+            {
+                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Por validar las credenciales del Operador.");
+                if (auth != EstatusRegreso.OK)
+                {
+                    LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Falló la validación de las credenciales del Operador.");
+                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
+                }
+
+                string UsuarioIdEncript = _rsaEncript.Encrypt(usuarioId);
+                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
+
+                #region Desasociar Ususario Token
+
+                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenSnEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.UnLinkTokenToUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Al desasociar usuario='{usuarioId}' del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                #endregion
+
+                #region Inhabiliatar Token
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.DisableToken(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Al inhabilitar token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                #endregion
+
+                #region Eliminar Usuario
+                lsTrnResCode = string.Empty;
+                lsTrnResMsg = string.Empty;
+                valorMSG = string.Empty;
+
+                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, string.Empty, string.Empty, string.Empty);
+
+                lsRegreso = _rsaClient.DeleteUser(lsEntrada);
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Al dar de baja al usuario='{usuarioId}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
+
+                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
+                {
+                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
+                        return EstatusRegreso.TokenInexistente;
+
+                    return EstatusRegreso.ErrorGeneral;
+                }
+                #endregion
+
+                return EstatusRegreso.OK;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.bajaUsuario_token|{ex}");
+                return EstatusRegreso.ErrorGeneral;
+            }
+        }
+        #endregion
+
+        #region ValidacionXml
+        /// <summary>
+        /// Método para validación de formato XML.
+        /// </summary>
+        /// <param name="textXML"></param>
+        /// <param name="trnResCode"></param>
+        /// <param name="trnResMsg"></param>
+        /// <param name="valorMSG"></param>
+        /// <returns></returns>
+        private bool EsValidoAnalisXml(ref string textXML, ref string trnResCode, ref string trnResMsg, ref string valorMSG)
+        {
+            XmlElement loXMLElement;
+            XmlElement loXMLSubElement;
+
+            XmlDocument loXMLDoc;
+            string error;
+
+            if (!XmlHelper.TryParseXmlSeguro(textXML, out loXMLDoc, out error))
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                LoggingConector.EscribirLog($"ERROR|RSAAdminService|XML inválido: {error}");
+                return false;
+            }
+
+            loXMLElement = loXMLDoc["SERVICE_RESPONSE"];
+
+            if (loXMLElement == null)
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            loXMLElement = loXMLDoc["TRANSACTION_RESPONSE"];
+
+            if (loXMLElement == null)
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            trnResCode = loXMLElement.Attributes?["trnResCode"]?.Value;
+            trnResMsg = loXMLElement.Attributes?["trnResMsg"]?.Value;
+
+            if (string.IsNullOrWhiteSpace(trnResCode) || string.IsNullOrWhiteSpace(trnResMsg))
+            {
+                trnResCode = "9";
+                trnResMsg = "XML invalido";
+                return false;
+            }
+
+            if (trnResCode == "0" && trnResMsg == "Success")
+            {
+                loXMLElement = loXMLElement["TOKEN_ADMIN_RESPONSE"];
+
+                if (loXMLElement == null)
+                    return false;
+
+                loXMLSubElement = loXMLElement["STATUS"];
+
+                if (loXMLSubElement == null)
+                    return false;
+
+                if (loXMLSubElement.InnerText == "0")
+                {
+                    loXMLSubElement = loXMLElement["MSG"];
+
+                    if (loXMLSubElement != null)
+                    {
+                        valorMSG = loXMLSubElement.InnerText;
+                    }
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="textoXML"></param>
+        /// <returns></returns>
+        private string XMLToTexto(string textoXML)
+        {
+            return Regex.Replace(
+                textoXML
+                .Replace("\r\n", "")
+                .Replace("\r", "")
+                .Replace("\n", "")
+                .Replace("\t", ""),
+                " {2,}",
+                " ");
+        }
+
+        #endregion
+
+        /// <summary>
+        /// Formato genero para XML Token Admin.
+        /// </summary>
+        /// <param name="usuarioId"></param>
+        /// <param name="serialNumber"></param>
+        /// <param name="firstToken"></param>
+        /// <param name="secondToken"></param>
+        /// <returns></returns>
+        private string GenerarXmlTokenAdmin(string usuarioId, string serialNumber, string firstToken, string secondToken)
+        {
+            return $@"<SERVICE>
+                    <TRANSACTION>
+                    <TOKEN_ADMIN>
+                    <CUST_USER_ID>{usuarioId}</CUST_USER_ID>
+                    <SERIAL_NUMBER>{serialNumber}</SERIAL_NUMBER>
+                    <FIRST_TOKEN>{firstToken}</FIRST_TOKEN>
+                    <SECOND_TOKEN>{secondToken}</SECOND_TOKEN>
+                    </TOKEN_ADMIN>
+                    </TRANSACTION>
+                    </SERVICE>";
+        }
+    }
+}
 
 
-            ' Si el total de lineas de la direccion superan a las que podia ingresar, las agregamos al nuevo campo
-            If totalLineasDir > (3 - totalLineasNameOrd) Then
-                agrega_valor_xml(variables_XML, "ordering_cust_adr_ext", Nothing, convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux.GetRange((3 - totalLineasNameOrd), totalLineasDir - (3 - totalLineasNameOrd))), 65, totalLineasNameOrd))
-            End If
-        End If
+using AplicacionConector.Utilidades;
+using MUFG_T24.Comunes;
+using System;
+using System.Globalization;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
 
-        If laMultivalorMX.Count > 0 Then
-            agrega_valor_xml(variables_XML, "ordering_name_addr", Nothing, laMultivalorMX)
-        End If
+namespace Utilidades
+{
+    /// <summary>
+    /// Declaración de variables.
+    /// </summary>
+    public class StateObject
+    {
+        public Socket WorkSocket { get; set; }
+        public const int BufferSize = 1024;
+        public byte[] Buffer { get; } = new byte[BufferSize];
+        public StringBuilder ResponseBuilder { get; } = new StringBuilder();
+        public int LargoEsperadoTotal { get; set; } = -1;
+    }
+    /// <summary>
+    /// Clase principal para métodos asincronos.
+    /// </summary>
+    public class AsynchronousClient : IDisposable
+    {
+        private readonly ManualResetEvent _connectDone = new ManualResetEvent(false);
+        private readonly ManualResetEvent _sendDone = new ManualResetEvent(false);
+        private readonly ManualResetEvent _receiveDone = new ManualResetEvent(false);
 
-        If objPACS008.dbtrAgt.nm <> "" Then
-            agrega_valor_xml(variables_XML, "order_inst_name", objPACS008.dbtrAgt.nm)
-            laMultivalorMX.Add(objPACS008.dbtrAgt.nm)
-        End If
+        private readonly string _clienteOrigen;
+        private readonly string _servidor;
+        private readonly int _puerto;
+        private readonly string _mensaje;
 
-        If Not objPACS008.dbtrAgt.pstlAdr Is Nothing Then
-            If objPACS008.dbtrAgt.pstlAdr.adrLine.Count > 0 Then ' si existe AdrlLine es una dirección no Estructurada
-                'lsNodoXML = busca_valor_xml_MX(lsNodoXML, "AdrLine", "Value", laMultivalorMX)
-                laMultivalorMX.AddRange(objPACS008.dbtrAgt.pstlAdr.adrLine)
-            End If
-        End If
-        If laMultivalorMX.Count > 0 Then
-            agrega_valor_xml(variables_XML, "order_inst_name_addr", Nothing, laMultivalorMX)
-        End If
+        private string _response = string.Empty;
+        private Socket _client;
+        private bool _disposed;
+        private Exception _lastException;
 
-        'Ordering Instruction
-        If objPACS008.dbtrAgt.nm <> "" Then
-            agrega_valor_xml(variables_XML, "order_inst_party", objPACS008.dbtrAgt.nm)
-        End If
 
-        'Ordering Institution BIC
-        Dim dbtrAgentBic As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/CdtTrfTxInf/DbtrAgt/FinInstnId/BICFI")
-        If Not String.IsNullOrWhitespace(dbtrAgentBic) Then
-            agrega_valor_xml(variables_XML, "order_inst_bic", dbtrAgentBic)
-        End If
+        /// <summary>
+        /// Constructor principal
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="servidor"></param>
+        /// <param name="puerto"></param>
+        /// <param name="mensaje"></param>
+        public AsynchronousClient(string clienteOrigen, string servidor, int puerto, string mensaje)
+        {
+            _clienteOrigen = clienteOrigen;
+            _servidor = servidor;
+            _puerto = puerto;
+            _mensaje = mensaje;           
+        }
 
-        'Creditor Account 
-        If objPACS008.cdtr.acctIdOthrId <> "" Then
-            agrega_valor_xml(variables_XML, "beneficiary_account", objPACS008.cdtr.acctIdOthrId)
-        End If
-        
-        ' Our Correspondent 
-        Dim instdRmbrsmntBic As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/GrpHdr/SttlmInf/InstdRmbrsmntAgt/FinInstnId/BICFI")
-        If Not String.IsNullOrWhitespace(instdRmbrsmntBic) Then
-            agrega_valor_xml(variables_XML, "rec_corr_bic", instdRmbrsmntBic)
-        End If
-        
-        Dim instgRmbrsmntBic As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/GrpHdr/SttlmInf/InstgRmbrsmntAgt/FinInstnId/BICFI")
-        If Not String.IsNullOrWhitespace(instgRmbrsmntBic) Then
-            agrega_valor_xml(variables_XML, "send_corr_bic", instgRmbrsmntBic)
-        End If
-        
-        Dim intermediaryAgent As String = GetValueByXPath(cbprMessage, "/Document/FIToFICstmrCdtTrf/CdtTrfTxInf/IntrmyAgt1/FinInstnId/BICFI")
-        If Not String.IsNullOrWhitespace(intermediaryAgent) Then
-            agrega_valor_xml(variables_XML, "int_cif", intermediaryAgent)
-        End If
+        #region Flujo principal
 
-        'Creditor Name
-        laMultivalorMX = New List(Of String)
-        laMultivalorMXAux = New List(Of String)
-        laMultivalorMXBen = New List(Of String)
-        totalLineasDir = 0
-        lsDireccionConcat = ""
-        If objPACS008.cdtr.nm <> "" Then
-            laMultivalorMX = convierteTexto_a_Multivalor_SinCortar_Local(objPACS008.cdtr.nm, 35, totalLineasNameBen)
+        /// <summary>
+        /// Método para inicializar peticiones Asincronas.
+        /// </summary>
+        private void Inicializar()
+        {
 
-            'Si el nombre rebasa las 2 lineas, mandamos al campo extra las lineas restantes
-            If (totalLineasNameBen > 2) Then
-                write_Log("INFO|interpreta_mensajes|A|totalLineasNameBen =" & totalLineasNameBen.ToString)
-                laMultivalorMX = regresaNLineasDeMultivalor(laMultivalorMX, 2, laMultivalorMXAux)
-                If laMultivalorMXAux.Count > 0 Then
-                    'Agregamos las lineas que no caben a la lista extra, estas lineas son de 65 caracteres
-                    write_Log("INFO|interpreta_mensajes|B|laMultivalorMXAux.Count =" & laMultivalorMXAux.Count.ToString)
-                    laMultivalorMXBen = convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux), 65, totalLineasNameBen)
-                End If
-            End If
-        End If
+            try
+            {
+                Log($"[{_clienteOrigen}]|HSM|Inicio|Servidor=[ {_servidor}]|Puerto=[{_puerto}]");
 
-        'Creditor address
-        If Not objPACS008.cdtr.pstlAdr Is Nothing Then
+                _client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
 
-            totalLineasNameBen = laMultivalorMX.Count
-            write_Log("INFO|interpreta_mensajes|totalLineasNameBen =" & totalLineasNameBen.ToString)
-            If objPACS008.cdtr.pstlAdr.adrLine.Count > 0 Then 
-                lsNodoXML = Join(objPACS008.cdtr.pstlAdr.adrLine, " ")
-                
-                ' Hybrid
-                If objPACS008.cdtr.pstlAdr.ctry <> "" Then
-                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.cdtr.pstlAdr.ctry)
-                End If
-                ' TownName debe ser requerido
-                If objPACS008.cdtr.pstlAdr.twnNm <> "" Then
-                    lsNodoXML = String.Concat(lsNodoXML, " ", objPACS008.cdtr.pstlAdr.twnNm)
-                End If
-                
-                write_Log("INFO|interpreta_mensajes|AdrLine =" & lsNodoXML)
-                laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsNodoXML, 35, totalLineasDir)
-                write_Log("INFO|interpreta_mensajes|laMultivalorMXAux.Count =" & laMultivalorMXAux.Count.ToString)
-            Else
-                If objPACS008.cdtr.pstlAdr.strtNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.strtNm)
-                End If
-                If objPACS008.cdtr.pstlAdr.bldgNb <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.bldgNb)
-                End If
-                If objPACS008.cdtr.pstlAdr.bldgNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.bldgNm)
-                End If
-                If objPACS008.cdtr.pstlAdr.flr <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.flr)
-                End If
-                If objPACS008.cdtr.pstlAdr.pstBx <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.pstBx)
-                End If
-                If objPACS008.cdtr.pstlAdr.room <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.room)
-                End If
-                If objPACS008.cdtr.pstlAdr.dept <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.dept)
-                End If
-                If objPACS008.cdtr.pstlAdr.subDept <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.subDept)
-                End If
-                'Country debe ser requerido
-                If objPACS008.cdtr.pstlAdr.ctry <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.ctry)
-                End If
-                ' TownName debe ser requerido
-                If objPACS008.cdtr.pstlAdr.twnNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.twnNm)
-                End If
-                If objPACS008.cdtr.pstlAdr.pstCd <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.pstCd)
-                End If
-                If objPACS008.cdtr.pstlAdr.ctrySubDvsn <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.ctrySubDvsn)
-                End If
-                If objPACS008.cdtr.pstlAdr.twnLctnNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.twnLctnNm)
-                End If
-                If objPACS008.cdtr.pstlAdr.dstrctNm <> "" Then
-                    lsDireccionConcat = String.Concat(lsDireccionConcat, " ", objPACS008.cdtr.pstlAdr.dstrctNm)
-                End If
+                _connectDone.Reset();
+                _sendDone.Reset();
+                _receiveDone.Reset();
 
-            End If
-            If lsDireccionConcat <> "" Then
-                laMultivalorMXAux = convierteTexto_a_Multivalor_SinCortar_Local(lsDireccionConcat, 35, totalLineasDir)
-            End If
-        End If
+                Log($"[{_clienteOrigen}]|HSM|Conetando|Inicio de conexión|Servidor=[ {_servidor}]|Puerto=[{_puerto}]");
+                _client.BeginConnect(_servidor, _puerto, ConnectCallback, _client);
 
-        ' Agregamos al array principal la o las lineas que quepan referente a la direccion
-        If laMultivalorMX.Count = 2 Then
-            write_Log("INFO|interpreta_mensajes|Array principal con 2 o mas lineas =" & laMultivalorMX.Count.ToString)
-            'laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 3 - totalLineasNameBen))
-            laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 1))
-        ElseIf laMultivalorMX.Count = 1 Then
-            write_Log("INFO|interpreta_mensajes|1|laMultivalorMX.Count =" & laMultivalorMX.Count.ToString)
-            'laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, 2 - totalLineasNameBen))
-            If laMultivalorMXAux.Count > 0 Then
-                laMultivalorMX.AddRange(laMultivalorMXAux.GetRange(0, laMultivalorMXAux.Count))
-            End If
-        End If
+                if (!_connectDone.WaitOne(TimeSpan.FromSeconds(60)))
+                {
+                    LogError("Timeout durante la conexión al HSM.");
+                    throw new TimeoutException("Timeout durante la conexión al HSM.");
+                }
+                if (_lastException != null)
+                {
+                    throw _lastException;
+                }
 
-        ' Si el total de lineas de la direccion superan a las que podia ingresar, las agregamos al nuevo campo
-        If totalLineasDir > (3 - totalLineasNameBen) Then
-            laMultivalorMXBen.AddRange(convierteTexto_a_Multivalor_SinCortar_Local(String.Join(" ", laMultivalorMXAux.GetRange((3 - totalLineasNameBen), totalLineasDir - (3 - totalLineasNameBen))), 65, totalLineasNameBen))
-            agrega_valor_xml(variables_XML, "beneficiary_name_ext", Nothing, laMultivalorMXBen)
-        ElseIf laMultivalorMXBen.Count > 0 Then
+                Send(_client, _mensaje);
 
-            agrega_valor_xml(variables_XML, "beneficiary_name_ext", Nothing, laMultivalorMXBen)
-        End If
+                if (!_sendDone.WaitOne(TimeSpan.FromSeconds(60)))
+                {
+                    LogError("Timeout durante la conexión al HSM.");
+                    throw new TimeoutException("Timeout durante el envío al HSM.");
+                }
+                if (_lastException != null)
+                {
+                    throw _lastException;
+                }
 
-        If laMultivalorMX.Count > 0 Then
-            agrega_valor_xml(variables_XML, "beneficiary_name_addr", Nothing, laMultivalorMX)
-        End If
+                Receive(_client);
+                if (!_receiveDone.WaitOne(TimeSpan.FromMinutes(1)))
+                {
+                    LogError("Timeout durante la conexión al HSM.");
+                    throw new TimeoutException("Timeout durante larecepción del HSM.");
+                }
+                if (_lastException != null)
+                {
+                    throw _lastException;
+                }
+            }
+            catch (SocketException ex)
+            {
+                LogError($"[{_clienteOrigen}] SocketException: {ex.Message}| SocketErrorCode: {ex.SocketErrorCode}| ErrorCode:{ex.ErrorCode}|StackTrace: {ex.StackTrace}");
+            }
+            catch (TimeoutException ex)
+            {
+                LogError($"[{_clienteOrigen}] Timeout: {ex.Message}|StackTrace: {ex.StackTrace}");
+            }
+            catch (Exception ex)
+            {
+                LogError($"[{_clienteOrigen}] Error inesperado: {ex}");
+            }
+            finally
+            {
+                try
+                {
+                    if (_client != null)
+                    {
+                        Shutdown();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogError($"Ocurrio un error al cerrar.|Error: {ex.Message}");
+                }
+            }
+        }
 
-        'Remittance Information
-        If objPACS008.rmtInfUstrd <> "" Then
-            agrega_valor_xml(variables_XML, "remmitance_information", objPACS008.rmtInfUstrd)
-        End If
+        #endregion
 
-        'Detail of Charges
-        If objPACS008.chrgBr <> "" Then
-            Select Case objPACS008.chrgBr
-                Case "CRED"
-                    agrega_valor_xml(variables_XML, "detail_charges", "BEN")
-                Case "DEBT"
-                    agrega_valor_xml(variables_XML, "detail_charges", "OUR")
-                Case "SHAR"
-                    agrega_valor_xml(variables_XML, "detail_charges", "SHA")
-            End Select
-        End If
-        
+        #region Callbacks
+        /// <summary>
+        /// Métod para realizar conexión 
+        /// </summary>
+        /// <param name="ar"></param>
+        private void ConnectCallback(IAsyncResult ar)
+        {
+            try
+            {
+                var client = (Socket)ar.AsyncState;
+                client.EndConnect(ar);
 
-        ' Sender's Charges Amount        
-        If objPACS008.chrgsInfAmt <> "" Then
-            agrega_valor_xml(variables_XML, "sender_amount", objPACS008.chrgsInfAmt)
-        End If
-        
-        Dim account As String
-        If lsCurrency = "USD" Then
-            ' La unica moneda que puede liquidarse por dos cuenta son los USD, de otra manera obtenemos la cuenta predeterminada.
-            Dim bic As String
-            If settlementMethod = "COVE" And Not String.IsNullOrWhiteSpace(instdRmbrsmntBic) Then
-                bic = instdRmbrsmntBic
-                write_Log("INFO|NostroAccount|A usar el BIC de nuestro corresponsal (tag 54a): " & bic)
-            ElseIf settlementMethod = "COVE" And Not String.IsNullOrWhiteSpace(instgRmbrsmntBic) Then
-                bic = instgRmbrsmntBic
-                write_Log("INFO|NostroAccount|A usar el BIC de nuestro corresponsal (tag 53a): " & bic)
-            Else 
-                bic = objPACS008.appHdr.frBICFI
-                write_Log("INFO|NostroAccount|A usar el BIC de quien emitio el mensaje: " & bic)
-            End If
-        
-            Dim debitAccountResult As Result(Of String) = GetDebitAccount(bic, lsCurrency) 
-            If debitAccountResult.IsSuccess Then
-                account = debitAccountResult.Data
-            Else 
-                Dim alert AS String = "No se encontro cuenta NOSTRO para el corresponsal, se busca cuenta del emisor: " & objPACS008.appHdr.frBICFI
-                Dim fallbackResult As Result(Of String) = GetDebitAccount(objPACS008.appHdr.frBICFI, lsCurrency) 
-                If fallbackResult.IsSuccess Then
-                    account = fallbackResult.Data
-                Else 
-                    alert = "No se encontro cuenta NOSTRO para el corresponsal ni para el emisor del mensaje, se utilizara la cuenta predeterminada en caso de autorizacion automatica (JP Morgan)"
-                    account = goT24_Connection.T24_NOSTRO_Account(lsCurrency)
-                End If
-                agrega_alerta(ICN, alert)
-            End If
-        Else 
-            Try
-                account = goT24_Connection.T24_NOSTRO_Account(lsCurrency)    
-            Catch ex As Exception
-                account = string.Empty    
-            End Try
-        End If
-        
-        If Not string.IsNullOrWhiteSpace(account) Then
-            agrega_valor_xml(variables_XML, "debit_account", account)
-        End If
-                                            
-        If string.IsNullOrWhiteSpace(account) And Not lsCurrency = "MXN" Then
-            razonRechazo = "No se encontro una cuenta a debitar."
-            Return False
-        End If
-        
-        Return True
-    End Function
+                Log($"[{_clienteOrigen}] Conectado correctamente");
+                _connectDone.Set();
+            }
+            catch (Exception ex)
+            {
+                _lastException = ex;
+                LogError($"ConnectCallback: {ex.Message}");
+                _connectDone.Set();
+            }
+        }
+        /// <summary>
+        /// Método para enviar petición de Socket.
+        /// /// </summary>
+        /// <param name="client"></param>
+        /// <param name="data"></param>
+        private void Send(Socket client, string data)
+        {
+            byte[] byteData = Encoding.ASCII.GetBytes(data);
+            client.BeginSend(byteData, 0, byteData.Length, SocketFlags.None, SendCallback, client);
+        }
+        /// <summary>
+        /// Método para enviar petición de Socket.
+        /// </summary>
+        /// <param name="ar"></param>
+        private void SendCallback(IAsyncResult ar)
+        {
+            try
+            {
+                var client = (Socket)ar.AsyncState;
+                int bytesSent = client.EndSend(ar);
+
+                Log($"[{_clienteOrigen}] Bytes enviados: {bytesSent}");
+                _sendDone.Set();
+            }
+            catch (Exception ex)
+            {
+                _lastException = ex;
+                LogError($"SendCallback: {ex.Message}");
+                _sendDone.Set();
+            }
+        }
+        /// <summary>
+        /// Método para recibir petición de Socket.
+        /// </summary>
+        /// <param name="client"></param>
+        private void Receive(Socket client)
+        {
+            var state = new StateObject { WorkSocket = client };
+
+            client.BeginReceive(state.Buffer, 0, StateObject.BufferSize, SocketFlags.None, ReceiveCallback, state);
+        }
+        /// <summary>
+        /// Recupera información solicitada por medio de Socket.
+        /// </summary>
+        /// <param name="ar"></param>
+        private void ReceiveCallback(IAsyncResult ar)
+        {
+            try
+            {
+                var state = (StateObject)ar.AsyncState;
+                var client = state.WorkSocket;
+
+                int bytesRead = client.EndReceive(ar);
+                Log($"Bytes recibidos: {bytesRead}");
+
+                if (bytesRead > 0)
+                {
+                    string chunk = Encoding.ASCII.GetString(state.Buffer, 0, bytesRead);
+                    Log($"Respuesta Chunk recibida: {chunk}");
+                    state.ResponseBuilder.Append(chunk);
+
+                    if (state.LargoEsperadoTotal < 0 && state.ResponseBuilder.Length >= 6)
+                    {
+                        string largoTexto = state.ResponseBuilder.ToString(0, 6);
+                        if (int.TryParse(largoTexto, NumberStyles.Integer, CultureInfo.InvariantCulture, out int largoBody) && largoBody >= 0)
+                        {
+                            state.LargoEsperadoTotal = 6 + largoBody;
+                        }
+                    }
+
+                    if (state.LargoEsperadoTotal > 0 && state.ResponseBuilder.Length >= state.LargoEsperadoTotal)
+                    {
+                        _response = state.ResponseBuilder.ToString(0, state.LargoEsperadoTotal);
+                        _receiveDone.Set();
+                        Log($"[{_clienteOrigen}] Respuesta recibida: {_response}");
+                        return;
+                    }
+
+                    client.BeginReceive(state.Buffer, 0, StateObject.BufferSize, SocketFlags.None, ReceiveCallback, state);
+                    return;
+                }
+                _response = state.ResponseBuilder.ToString();
+                _receiveDone.Set();
+
+                Log($"[{_clienteOrigen}] Respuesta recibida: {_response}");
+            }
+            catch (Exception ex)
+            {
+                _lastException = ex;
+                LogError($"ReceiveCallback: {ex.Message}");
+                _receiveDone.Set();
+            }
+        }
+
+        #endregion
+
+        #region Público
+        /// <summary>
+        /// Método para obtener respuesta.
+        /// </summary>
+        /// <returns></returns>
+        public string Execute()
+        {
+            Inicializar();
+            return _response;
+        }
+
+        #endregion
+
+        #region Limpieza
+        /// <summary>
+        /// Método para apagar el cliente.
+        /// </summary>
+        private void Shutdown()
+        {
+            try
+            {
+                if (_client != null && _client.Connected)
+                {
+                    _client.Shutdown(SocketShutdown.Both);
+                    _client.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError($"Error al cerrar socket: {ex.Message}");
+            }
+        }
+        /// <summary>
+        /// Método para liberar recursos.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_disposed) return;
+
+            Shutdown();
+
+            _connectDone.Dispose();
+            _sendDone.Dispose();
+            _receiveDone.Dispose();
+
+            _disposed = true;
+            GC.SuppressFinalize(this);
+        }
+        /// <summary>
+        /// Método para liberar recursos.
+        /// </summary>
+        ~AsynchronousClient()
+        {
+            Dispose();
+        }
+
+        #endregion
+
+        #region Logging
+        /// <summary>
+        /// Lo para registro de Información.
+        /// </summary>
+        /// <param name="mensaje"></param>
+        private static void Log(string mensaje)
+        {
+            LoggingConector.EscribirLog($"[INFO] {mensaje}");
+        }
+        /// <summary>
+        /// Log para registro de errores.
+        /// </summary>
+        /// <param name="mensaje"></param>
+        private static void LogError(string mensaje)
+        {
+            LoggingConector.EscribirLog($"[ERROR] {mensaje}");
+        }
+        #endregion
+    }
+}
+
+
+using AplicacionConector.Enums;
+using AplicacionConector.Interfaces;
+using AplicacionConector.Utilidades;
+using MUFG_T24.Comunes;
+using MUFG_T24.Configuracion_utilidades;
+using MUFG_T24.Interfaces_utilidades;
+using System;
+using Utilidades;
+
+namespace InfraestructuraConector.HSM
+{
+    /// <summary>
+    /// Clase para conexión HSM Client
+    /// </summary>
+    public class HsmTcpClient : IHsmClient
+    {
+        private readonly IHsmConfig _config;
+        private readonly Configuracion _configuracion;
+        /// <summary>
+        /// Constructor
+        /// </summary>
+        /// <param name="config"></param>
+        public HsmTcpClient(IHsmConfig config, IParametrizacion parametrizacion, Configuracion configuracion)
+        {
+            _config = config;
+            _configuracion = configuracion;
+        }
+        /// <summary>
+        /// Método para enviar mensaje.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="mensaje"></param>
+        /// <returns></returns>
+        public string Enviar(string clienteOrigen, string mensaje)
+        {
+            
+            try
+            {
+                string Host = ObtenerValor(ConstantesServicio.HSMSERVIDOR, x => x);
+                int Puerto = Convert.ToInt16(ObtenerValor(ConstantesServicio.HSMPUERTO, y => y));
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|Enviar|Iniciando envio de mensaje, servidor='{Host}', puerto={Puerto}, mensaje='{mensaje}'.");
+
+                string respuesta = string.Empty;               
+
+                using (var envio = new AsynchronousClient(clienteOrigen, Host, Puerto, mensaje))                
+                {
+                    respuesta = envio.Execute();
+                }
+
+                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|Enviar|Mensaje enviado correctamente|Regreso='{respuesta}'.");
+
+                return respuesta;
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog(
+                    $"ERROR|{clienteOrigen}|Enviar|{ex}"
+                );
+
+                return string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// Método para recuperar valor.
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="clave"></param>
+        /// <param name="parser"></param>
+        /// <param name="defaultValue"></param>
+        /// <returns></returns>
+        T ObtenerValor<T>(string clave, Func<string, T> parser, T defaultValue = default)
+        {
+            if (_configuracion.ParametrosSistema.TryGetValue(clave, out var valor))
+                return parser(valor);
+
+            LoggingConector.EscribirLog($"INFO|ObtenerValor|Clave no encontrada en BD: {clave}");
+            return defaultValue;
+        }
+    }
+}
+
+
+using AplicacionConector.Enums;
+using AplicacionConector.Interfaces;
+using AplicacionConector.Utilidades;
+using MUFG_T24.Comunes;
+using MUFG_T24.Configuracion_utilidades;
+using MUFG_T24.Interfaces_utilidades;
+using System;
+using System.Threading.Tasks;
+
+namespace AplicacionConector
+{
+    /// <summary>
+    /// Método principal del servicio
+    /// </summary>
+    public class RequestProcessor : IRequestProcessor
+    {
+        private readonly Func<IRSAService> _rsaServiceFactory;
+        private readonly Func<IHSMService> _hsmServiceFactory;
+        private readonly IControlServicio _controlServicio;
+        private readonly Configuracion _configuracion;
+        private readonly IParametrizacion _parametrizacion;
+
+        /// <summary>
+        /// Constructor principal del servicio
+        /// </summary>
+        /// <param name="rsaServiceFactory"></param>
+        /// <param name="hsmServiceFactory"></param>
+        /// <param name="configuracion"></param>
+        /// <param name="controlServicio"></param>
+        /// <param name="parametrizacion"></param>
+        public RequestProcessor(Func<IRSAService> rsaServiceFactory, Func<IHSMService> hsmServiceFactory, Configuracion configuracion, IControlServicio controlServicio,
+            IParametrizacion parametrizacion)
+        {
+            _rsaServiceFactory = rsaServiceFactory;
+            _hsmServiceFactory = hsmServiceFactory;
+            _configuracion = configuracion;
+            _controlServicio = controlServicio;
+            _parametrizacion = parametrizacion;
+        }
+        /// <summary>
+        /// Método principal para distiguir la opción 
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="solicitud"></param>
+        /// <returns></returns>
+        /// <exception cref="ArgumentNullException"></exception>
+        /// <exception cref="ArgumentException"></exception>
+        public async Task<string> ProcesarPeticionAsync(string clienteOrigen, string solicitud)
+        {
+
+            if (string.IsNullOrWhiteSpace(solicitud))
+                throw new ArgumentNullException(nameof(solicitud));
+
+            if (solicitud.Length < 4)
+                throw new ArgumentException("Solicitud inválida.");
+
+            string tipoSolicitud = solicitud.Substring(0, 3);
+            string payload = solicitud.Substring(4);
+
+
+            try
+            {
+                switch (tipoSolicitud)
+                {
+                    case ConstantesServicio.TIPO_SOLICITUD_RSA:
+                        return await _rsaServiceFactory().ProcesarPeticionAsync(clienteOrigen,payload);
+
+                    case ConstantesServicio.TIPO_SOLICITUD_HSM:
+                        return await _hsmServiceFactory().ProcesarPeticionAsync(clienteOrigen,payload);
+
+                    default:
+                        throw new InvalidOperationException($"Tipo de solicitud no soportada: {tipoSolicitud}");
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"Error|ProcesarPeticionAsync|mensaje: {ex}");
+                throw;
+            }
+            finally
+            {
+                await TerminaContextoAsync();
+            }
+            
+        }
+
+        /// <summary>
+        /// Método para marcar la terminación del servicio.
+        /// </summary>
+        /// <returns></returns>
+        private async Task TerminaContextoAsync()
+        {
+            await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio);
+        }
+
+    }
+}
+
+
+using AplicacionConector.Enums;
+using AplicacionConector.Interfaces;
+using AplicacionConector.Utilidades;
+using MUFG_T24.Comunes;
+using MUFG_T24.Configuracion_utilidades;
+using System;
+using System.Globalization;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace AplicacionConector
+{
+    /// <summary>
+    /// Clase principal para el servicio HSM.
+    /// </summary>
+    public class HSMService : IHSMService
+    {
+        private const string Prefijo = ConstantesServicio.Prefijo;
+        private const string CodigoOk = ConstantesServicio.CodigoOk;
+
+        private readonly Configuracion _configuracion;
+        private readonly IHsmClient _hsmClient;
+        private readonly IHsmConfig _hsmConfig;
+        private IHsmConfig _hcConfig;
+
+        public HSMService(Configuracion configuracion, IHsmClient hsmClient, IHsmConfig hsmConfig)
+        {
+            _configuracion = configuracion;
+            _hsmClient = hsmClient;
+            _hsmConfig = hsmConfig;
+        }
+        /// <summary>
+        /// Método para procesar petición HSM.
+        /// </summary>
+        /// <param name="clienteOrigen"></param>
+        /// <param name="solicitud"></param>
+        /// <returns></returns>
+        public async Task<string> ProcesarPeticionAsync(string clienteOrigen, string solicitud)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(solicitud))
+                    throw new Exception("Solicitud vacía.");
+
+                var parametros = solicitud.Split('|').Select(p => p?.Trim()).ToArray();
+
+                if (parametros.Length == 0)
+                    throw new Exception("Formato inválido.");
+
+                ValidarCantidadParametros(parametros, 1);
+                switch (parametros[0].ToLower())
+                {
+                    case ConstantesServicio.VALIDA:
+
+                        ValidarCantidadParametros(parametros, 3);
+                        if (_hsmConfig.Eco)
+                        {
+                            LogInfo("Modo ECO habilitado.", clienteOrigen);
+                            return ConstantesServicio.Cero;
+                        }
+
+                        return ValidaPase(clienteOrigen, parametros[1], parametros[2]);
+
+                    case ConstantesServicio.GENERA:
+                        ValidarCantidadParametros(parametros, 2);
+                        return GeneraClave(clienteOrigen, parametros[1]);
+
+                    default:
+                        LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|HSM|Operacion no soportada:{parametros[0]}");
+                        return ConstantesServicio.Nueve;
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|HSM|ProcesarPeticion|{ex}");
+                return ConstantesServicio.Nueve;
+            }
+        }
+
+        #region Operaciones HSM
+        /// <summary>
+        /// Método para validar pase Validar Pase
+        /// </summary>
+        /// <param name="origen"></param>
+        /// <param name="hash"></param>
+        /// <param name="clave"></param>
+        /// <returns></returns>
+        private string ValidaPase(string origen, string hash, string clave)
+        {
+            if (string.IsNullOrEmpty(origen))
+                throw new ArgumentNullException("Origen requerido.", nameof(origen));
+
+            if (string.IsNullOrEmpty(hash))
+                throw new ArgumentNullException("Hash requerido.", nameof(hash));
+
+            if (string.IsNullOrEmpty(clave))
+                throw new ArgumentNullException("Clave requerido.", nameof(clave));
+
+            const string comando = ConstantesServicio.comando0905;
+
+            string peticion = comando + GeneraLMK17() + ConstantesServicio.H + hash.Length.ToString().PadLeft(4, '0') +
+                hash + ConstantesServicio.CeroUno + clave.Length.ToString().PadLeft(4, '0') + clave;
+
+
+            LogInfo($"ValidaPase request:{peticion}", origen);
+
+            string response = _hsmClient.Enviar(origen, ConstruirMensaje(peticion));
+
+            if (string.IsNullOrEmpty(response))
+                throw new ArgumentNullException("El HSM no devolvio una respuesta valida");
+
+            string data = InterpretarRespuesta(response, comando);
+
+            LoggingConector.EscribirLog($"data:{data}");
+
+            return data == ConstantesServicio.Uno ? ConstantesServicio.Cero : ConstantesServicio.Uno;
+        }
+
+        private string GeneraClave(string origen, string hash)
+        {
+            LoggingConector.EscribirLog($"INFO|HSM|GeneraClave|origen:{origen}|hash: {hash}");
+            if (string.IsNullOrEmpty(origen))
+            {
+                LoggingConector.EscribirLog($"ERROR|HSM|El origen es vacio o nulo.");
+                throw new ArgumentNullException("El origen es requerido.", nameof(origen));
+            }
+
+            if (string.IsNullOrEmpty(hash))
+            {
+                LoggingConector.EscribirLog($"ERROR|HSM|Hash es vacio o nulo.");
+                throw new ArgumentNullException("El Hash es requerido.", nameof(hash));
+            }
+
+            const string comando = ConstantesServicio.comando0904;
+
+            string peticion = comando + GeneraLMK17() + ConstantesServicio.H + hash.Length.ToString().PadLeft(4, '0') + hash;
+            LoggingConector.EscribirLog($"INFO|{origen}|HSM|GeneraClave|Enviando petición|Peticion=[{peticion}]");
+
+            string response;
+            try
+            {
+                response = _hsmClient.Enviar(origen, ConstruirMensaje(peticion));
+            }
+            catch (Exception ex)
+            {
+                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Error al enviar petición al HSM|Error=[{ex.Message}]");
+                return string.Empty;
+            }
+            
+            LoggingConector.EscribirLog($"INFO|{origen}|HSM|GeneraClave|Respuesta recibida={response}");
+
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Respuesta vacía del HSM|Comando=[{comando}]");
+                return string.Empty;
+            }
+
+            string data = InterpretarRespuesta(response, comando);
+
+            LoggingConector.EscribirLog($"INFO|{origen}|HSM|GeneraClave|Resultado InterpretarRespuesta|DataLength={(data == null ? 0 : data.Length)}");
+
+            if (string.IsNullOrEmpty(data))
+            {
+                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|InterpretarRespuesta devolvio vacío|Response.Lenght=[{response.Length}]|Comando=[{comando}]");
+                return string.Empty;
+            }
+
+            if (data.Length < 4)
+            {
+                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Respuesta menor a 4 caracteres|Formato de respuesta inválido.|DataLength=[{data.Length}]");
+                return string.Empty;
+            }
+
+            if (!int.TryParse(data.Substring(0, 4), out int largo))
+            {
+                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Formato de respuesta inválido|Longitud de clave no numerica|Largo recibido=[{largo}]|DataLength=[{data.Length}]");
+                return string.Empty;
+            }
+
+            string clave = data.Substring(4);
+
+            if (largo != clave.Length)
+            {
+                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Longitud inválida.");
+                return string.Empty;
+            }
+
+            LogInfo($"Clave generada correctamente:{clave}", origen);
+            return ConstantesServicio.Cero + clave;
+        }
+
+        #endregion
+
+        #region Construcción Mensajes
+        /// <summary>
+        /// Método para genera clave LMK17
+        /// </summary>
+        /// <returns></returns>
+        /// <exception cref="InvalidOperationException"></exception>
+        private string GeneraLMK17()
+        {
+            if (_hcConfig == null)
+            {
+                _hcConfig = ObtenerConfiguracionHsm();
+            }
+
+            if (string.IsNullOrWhiteSpace(_hcConfig.LMK17))
+                throw new InvalidOperationException("LMK17 no configurado.");
+
+            if (string.IsNullOrWhiteSpace(_hcConfig.LMK17Check))
+                throw new InvalidOperationException("LMK17Check no configurado.");
+
+            return ConstantesServicio.D + _hcConfig.LMK17.Length.ToString().PadLeft(4, '0') + _hcConfig.LMK17 +
+                ConstantesServicio.L17 + _hcConfig.LMK17Check.Length.ToString().PadLeft(2, '0') + _hcConfig.LMK17Check;
+        }
+        /// <summary>
+        /// Método para armar mensaje completo de servicio HSM.
+        /// </summary>
+        /// <param name="body"></param>
+        /// <returns></returns>
+        private string ConstruirMensaje(string body)
+        {
+            string mensajeCompleto = Prefijo + body;
+            LoggingConector.EscribirLog(mensajeCompleto.Length.ToString().PadLeft(6, '0') + mensajeCompleto);
+            return mensajeCompleto.Length.ToString().PadLeft(6, '0') + mensajeCompleto;
+
+
+        }
+
+        /// <summary>
+        /// Método para interpretar respuesta de servicio HSM.
+        /// </summary>
+        /// <param name="respuesta"></param>
+        /// <param name="comando"></param>
+        /// <returns></returns>
+        private string InterpretarRespuesta(string respuesta, string comando)
+        {
+            if (string.IsNullOrWhiteSpace(respuesta))
+                return string.Empty;
+
+            LoggingConector.EscribirLog($"respuesta:[{respuesta}]|respuesta.Lenght={respuesta.Length}|comando:{comando}");
+
+            int largo = ParseEnteroRequerido(respuesta.Substring(0, 6), "LargoRespuestaHSM");
+
+            string body = respuesta.Substring(6);
+
+            LoggingConector.EscribirLog($"largo declarado:[{largo.ToString()}]|body:[{body}]|body.Lenght=[{body.Length}]");
+
+            if (largo != body.Length)
+            {
+                LoggingConector.EscribirLog($"ERROR|HSM|InterpretarRespuesta|Longitud inválida.|Esperado={largo}|Real={body.Length}");
+                return string.Empty;
+            }
+
+            string encabezado = Prefijo + comando + CodigoOk;
+
+            LoggingConector.EscribirLog($"Prefijo=[{Prefijo}]|Prefijo.Length=[{Prefijo.Length}]|comando=[{comando}]|comando.Lenght=[{comando.Length}]|CodigoOK=[{ConstantesServicio.CodigoOk}]|CodigoOK.Lenght=[{ConstantesServicio.CodigoOk.Length}]");
+            bool coincide = body.StartsWith(encabezado);
+            LoggingConector.EscribirLog($"Prefijo=[{Prefijo}]|body.Lenght=[{body.Length}]|encabezado=[{encabezado}]|encabezado.Lenght=[{encabezado.Length}]|StartsWith=[{coincide}]");
+
+            if (!coincide)
+            {
+                LoggingConector.EscribirLog($"ERROR|HSM|InterpretarRespuesta|Código de respuesta inválido.");
+
+                return string.Empty;
+            }
+
+            string resultado = body.Substring(encabezado.Length);
+
+            LoggingConector.EscribirLog($"Resultado=[{resultado}]|resultado.Length=[{resultado.Length}]");
+            return resultado;
+        }
+
+        #endregion
+
+        #region Logging
+        /// <summary>
+        /// Método para imprimir Log Informativo de HSM.
+        /// </summary>
+        /// <param name="mensaje"></param>
+        /// <param name="clienteOrigen"></param>
+        private void LogInfo(string mensaje, string clienteOrigen)
+        {
+            LoggingConector.EscribirLog($"INFO|{clienteOrigen}|HSM|{mensaje}");
+        }
+        #endregion
+
+        /// <summary>
+        /// Método para obtener valor de parametros de configuracion de MQ.
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="clave"></param>
+        /// <param name="parser"></param>
+        /// <param name="defaultValue"></param>
+        /// <returns></returns>
+        T ObtenerValor<T>(string clave, Func<string, T> parser, T defaultValue = default)
+        {
+            if (_configuracion.ParametrosSistema.TryGetValue(clave, out var valor))
+                return parser(valor);
+
+            LoggingConector.EscribirLog($"INFO|ObtenerValor|Clave no encontrada en BD: {clave}");
+            return defaultValue;
+        }
+
+        /// <summary>
+        /// Método para obtener configuracion HSM.
+        /// </summary>
+        /// <returns></returns>
+        public HsmConfig ObtenerConfiguracionHsm()
+        {
+            return new HsmConfig
+            {
+                Host = ObtenerValor(ConstantesServicio.HSMSERVIDOR, x => x),
+                Puerto = ParseEnteroRequerido(ObtenerValor(ConstantesServicio.HSMPUERTO, x => x), ConstantesServicio.HSMPUERTO),
+                LMK17 = ObtenerValor(ConstantesServicio.HSMLMK17, x => x),
+                LMK17Check = ObtenerValor(ConstantesServicio.HSMCSLMK17, x => x),
+                Eco = ParseBooleanoRequerido(ObtenerValor(ConstantesServicio.RSA_ECO, x => x), ConstantesServicio.RSA_ECO)
+            };
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="valor"></param>
+        /// <param name="nombreCampo"></param>
+        /// <returns></returns>
+        /// <exception cref="Exception"></exception>
+        public static int ParseEnteroRequerido(string valor, string nombreCampo)
+        {
+            if (string.IsNullOrWhiteSpace(valor))
+            {
+                throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' porque viene vacío.");
+            }
+
+            if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result))
+            {
+                return result;
+            }
+
+            throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' con valor '" + valor + "' a Int32.");
+        }
+
+        /// <summary>
+        /// Método pra validar cantidad de parametros
+        /// </summary>
+        /// <param name="parametros"></param>
+        /// <param name="cantidadEsperada"></param>
+        /// <exception cref="ArgumentException"></exception>
+        private static void ValidarCantidadParametros(string[] parametros, int cantidadEsperada)
+        {
+            if (parametros.Length < cantidadEsperada)
+            {
+                throw new ArgumentException(
+                    "Cantidad de parámetros inválida.");
+            }
+        }
+        public static bool ParseBooleanoRequerido(string valor, string nombreCampo)
+        {
+            if (string.IsNullOrWhiteSpace(valor))
+            {
+                throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' porque viene vacío.");
+            }
+
+            if (bool.TryParse(valor, out var result))
+            {
+                return result;
+            }
+
+            if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result2) && (result2 == 0 || result2 == 1))
+            {
+                return result2 == 1;
+            }
+
+            throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' con valor '" + valor + "' a Boolean.");
+        }
+    }
+}
+
+
