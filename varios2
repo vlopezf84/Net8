@@ -1,2720 +1,416 @@
-using AplicacionConector;
-using AplicacionConector.Enums;
-using AplicacionConector.Interfaces;
-using AplicacionConector.Utilidades;
-using InfraestructuraConector.HSM;
-using InfraestructuraConector.SOAP;
-using MUFG_T24.Comunes;
-using MUFG_T24.Comunes.Encriptacion;
-using MUFG_T24.Configuracion_utilidades;
-using MUFG_T24.Inicializacion_utilidades;
-using MUFG_T24.Interfaces_utilidades;
-using MUFG_T24.Logeo_utilidades;
-using MUFG_T24.Modelos;
-using SimpleInjector;
-using SimpleInjector.Lifestyles;
-using System;
-using System.Globalization;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.ServiceProcess;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
+Calypso inMT300 Recommendations
+Calypso_inMT300 - Architecture & Code Quality Recommendations
+Solution: Calypso_inMT300.slnx (../../CALYPSO/Calypso_inMT300/Calypso_inMT300.slnx). Reviewed: 2026-10-22, branch develop, commit 9ae25861ef5d536ca7878a200bc40843646ee7f5 (2026-10-08), clean working tree. Compared against: LoansApp coding-practices baseline (../BaseLine_Docs/LoansApp_Architecture_Patterns_and_Coding_Practices.md) and PR review/severity checklist (../BaseLine_Docs/code_review.md). See also: orchestration/control (./_ORCHESTRATION.md) (methodology, template, standing findings), application understanding (master) (../Application_understanding_technical_document_master.md) and the two stored procedures this service calls, sp_CinMT300_GetOperacionesMT300 (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/001%20SP%20sp_CinMT300_GetOperacionesMT300.sql) and usp_CinMT300_UpdMT300Procesado (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/002%20SP%20usp_CinMT300_UpdMT300Procesado.sql). Target: .NET Framework 4.8 Windows Service (x86) plus two T-SQL procedures; focus: all categories; severity threshold: all. Audit only: no application fixes applied.
+1. Solution Overview (low/no-dependency -> high dependency)
+Tier	Project	Kind	Path
+-	Database layer (outside this repository)	2 T-SQL procedures in InterfacesT24 (TOMI)	IT24/Procedures (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures)
+0	Aplicacion_inMT300	Class library (tick orchestration, execution-window validator, interfaces, DTO/models, constants)	Aplicacion_inMT300.csproj (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Aplicacion_inMT300.csproj)
+1	Infraestructura_inMT300	Class library (TOMI repository, ActiveMQ/NMS client, alert/log adapter, connection-error mapper)	Infraestructura_inMT300.csproj (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Infraestructura_inMT300.csproj)
+2	Calypso_inMT300	Windows Service executable (composition root, WindowsServiceHostBase)	Calypso_inMT300.csproj (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/Calypso_inMT300.csproj)
+2	PruebasUnitarias	MSTest/Moq library (3 test methods; SDK-style, net48)	PruebasUnitarias.csproj (../../CALYPSO/Calypso_inMT300/PruebasUnitarias/PruebasUnitarias.csproj)
 
-namespace Conector
+What this solution actually does: it is the outbound leg of the SWIFT MT300 (FX confirmation) feed into Calypso. On every timer tick it marks the start of the tick in TOMI, reads the TOMI system date and ten system parameters (CALYPSO_MQ_*, CALYPSO_MT300_MAX_REGISTROS), refuses to run on a non-business day (raising an alert) or outside the configured CALYPSO_MQ_HORA_INICIO/CALYPSO_MQ_HORA_FIN window, and then calls sp_CinMT300_GetOperacionesMT300. That procedure scans the last eight days of TB_SRV_SWF_TRABAJO for incoming SWIFT MT-300 messages that have not been authorised or sent (NF_MQ_MSG_ETL IS NULL) and whose work-plan item is not yet PROC, extracts the trade date from the :30T: tag, marks the work-plan item `PROC` and the job row `NF_IMPRESION = '1'` for every candidate, and returns Folio, Mensaje, fechaTrade (all rows, or the first @MaxRegistros when it is greater than zero). The service then opens one ActiveMQ connection, publishes each message as a persistent text message to the CALYPSO_MQ_IN_MT300 queue and, after each publish, calls usp_CinMT300_UpdMT300Procesado, which stamps NF_HORA_AUTORIZACION, OFS_AUTHOR and NF_MQ_MSG_ETL = 'EXITOSO' on the job row. Any exception while sending or marking is logged, the rest of the batch is abandoned, and the connection is closed. The service does not consume from any queue, does not talk to T24 and moves no money; what Calypso does with the message, and who else reads NF_MQ_MSG_ETL/NF_IMPRESION, is not in this repository.
+1.1 Issue Summary
+Recommended priority	Count	Simple meaning
+Blocker	2	Close before approving a release: the read procedure marks every candidate PROC before anything is sent, so any failure, stop or @MaxRegistros limit silently loses confirmations (CMT-FR-1); the build is not reproducible (D:\ServiceCMS, CMT-FR-19)
+Major	10	Correct or explicitly accept before relying on the service: one malformed message aborts the whole read after earlier rows were already marked (2); the returned trade date does not match the key the update uses (3); send/mark failures are only logged and reported as success (5, 6); an alert row per tick on every non-business day (7); SQL failures look like "nothing pending" (12); the ActiveMQ connection leaks when the broker is down (13); full MT300 bodies in the error log (14); a test suite that cannot compile and proves almost nothing (22, 23)
+Minor	12	Maintainability, diagnosability and cleanup after correctness work
+Total distinct findings	24	One category per finding; no duplicate tickets
+
+Skill category	Count
+MustChange/rewrite	12
+rewrite_recommended	9
+NiceToRewrite_ifTimePermits	3
+
+Priorities are source-review release recommendations, not CVSS or proof of a production incident. Items marked *verify* depend on facts not present in the repository (the real TB_SRV_SWF_PLAN_TRABAJO_MAESTRO rows, table DDL, the encrypted service configuration that holds the timer interval, the broker URI options, the deployed MUFG_T24.dll). No SQL injection (both procedures are called with typed parameters), cleartext credential logging, weak cryptography primitive, throw ex;, sync-over-async, FirstOrDefault() dereference or hard-coded secret was found (see 2.2).
+2. Scope & Methodology Note
+Area	Evidence / limitation
+Source scope	34/34 tracked files, 2,193/2,193 physical lines read, not sampled: 24 C# files (1,408 lines: Aplicacion 13 / 518, Infraestructura 5 / 374, host 4 / 256, tests 2 / 260), four .csproj, Calypso_inMT300.slnx, App.config, two packages.config, .gitignore (363) and .gitattributes (63) (standard Visual Studio / * text=auto content). Per project, including its project file and configs: Aplicacion 14 / 600, Infraestructura 7 / 472, host 7 / 383, tests 3 / 290, solution and repository files 3 / 448
+Not tracked	PruebasUnitarias\obj\ (14 restore/build-input files, git-ignored by rule [Oo]bj/) and an empty PruebasUnitarias\bin\. No compiled assembly exists, which is consistent with (but does not prove) the compile errors in CMT-FR-22
+Context also read	The two T-SQL procedures (355 lines) and Scripts\Script_PruebaControlada.sql (33 lines); shared MUFG_T24 source in General\MUFGT24_BTMUM_64 only to confirm or rule out local findings: WindowsServiceHostBase, RepositorioMaestro (EjecutarStoredProcedureQuery, EjecutarStoredProceduredNonQuery, FinalizarResultadoStoredProcedure, ValidarResultadoStoredProcedure, ActualizaEJecucion, ActualizaTerminacion, EsDiaHabil), Parametrizacion.ObtenerParametrosSistemaAsync/ObtenerHoraSistema, IParametrizacion, FileLogger (masking). Shared-library defects are out of scope
+Review basis	Full current-source audit, not a changed-lines PR verdict
+Executed probes	On Windows PowerShell 5.1 / .NET Framework 4: (a) [CallerMemberName] declared only on an implementation is empty when called through the interface (CMT-FR-17); (b) TimeSpan.TryParse of "8", "18", "24:00" and an overnight window (CMT-FR-9); (c) a stand-in compile of the two expression-tree shapes used by the tests, which reproduces both errors (CMT-FR-22). The probes use stand-in types, not production code or data
+Build	Not built. D:\ServiceCMS does not exist on this machine, so MUFG_T24.dll is unavailable; neither dotnet nor msbuild is on PATH, and the NuGet cache holds no Moq/MSTest
+Tests	3 real MSTest methods; reviewed, not executed; no coverage measured. Findings about them are derived by reading the set-ups against the IParametrizacion/IMQServicio source on disk
+Not available	Deployed MUFG_T24.dll, the real TB_SRV_SWF_TRABAJO/TB_SRV_SWF_PLAN_TRABAJO_MAESTRO data and DDL, the encrypted ConfiguracionEncriptadaHelper settings (timer interval), the broker URI/options in CALYPSO_MQ_SERVIDOR, the stored value of CALYPSO_MQ_PSW, the Calypso consumer, SLAs
+
+2.1 Full-read batches (single session, 2026-10-22)
+Batch	Files / lines	Content
+1	14 / 600	Aplicacion_inMT300: OperacionServicio, ValidadorEjecucion, 5 interfaces, DTO, 2 models, 2 enums/constants, AssemblyInfo, .csproj
+2	7 / 472	Infraestructura_inMT300: MQServicio, MapConnectionError, OperacionesTomiDao, AppLogger, AssemblyInfo, .csproj, packages.config
+3	7 / 383	Calypso_inMT300 host: ServiceHost, Program, designer, AssemblyInfo, .csproj, App.config, packages.config
+4	3 / 290	PruebasUnitarias: OperacionServicioUT, MSTestSettings, .csproj
+5	3 / 448	Calypso_inMT300.slnx, .gitignore, .gitattributes
+6	context	The two procedures, the controlled-test script and the shared classes listed above
+
+2.2 Quantified cross-checks (supplement to the full read)
+Check	Result
+Absolute D:\ServiceCMS HintPaths	9 in 4 projects: Aplicacion 1 (MUFG_T24), Infraestructura 3 (Apache.NMS, Apache.NMS.ActiveMQ, MUFG_T24), host 4 (Apache.NMS, Apache.NMS.ActiveMQ, MUFG_T24, SimpleInjector), tests 1 (MUFG_T24); no nuget.config
+Verbatim sibling copies (trimmed non-trivial lines present in the Calypso_Liquidacion file)	ServiceHost.cs 99/115 (86 %), ValidadorEjecucion.cs 58/66 (88 %), AppLogger.cs 63/67 (94 %), ResultadoValidacionModel.cs 12/16 (75 %); ValidadorEjecucion exists in 3 solutions, AppLogger in 5, MapConnectionError/GetApacheNMSErrorDescription in 2 (here and FCMConector)
+Database/state calls made without a CancellationToken	7 of 7 per-tick call sites: ActualizaEJecucion(name) (OperacionServicio.cs:49), ObtenerFechaSistemaAsync() (:79), ObtenerParametrosSistemaAsync(string) (:80), EsDiaHabil() (ValidadorEjecucion.cs:59), ObtenerListaMT300Pendientes (:117), ActualizarMT300ProcesadoAsync (:144), ActualizaTerminacion(name) (:63); the token overloads exist in the shared library
+Secrets, passwords, tokens or connection strings in tracked files	0 (the password key CALYPSO_MQ_PSW appears only as a name, ConstantesServicio.cs:9, 17)
+throw ex;, .Result, .Wait(), GetAwaiter().GetResult(), Thread.Sleep, async void, DateTime.Now, crypto types	0 in the solution (the DateTime.Now clock is inside the shared ObtenerHoraSistema)
+FirstOrDefault/SingleOrDefault on materialised data	0
+Test methods / assertions on the returned value	3 / 1 (Assert.IsTrue(resultado) in the third test only)
+
+3. What's Already Good
+• Layering and seams. Aplicacion -> Infraestructura -> host with an interface for every collaborator (IMQServicio, IOperacionesTomi, IValidadorEjecucion, IAppLogger, IOperacionServicio), all constructor-injected (OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):30-39). The business flow is therefore unit-testable without a broker or a database.
+• Composition root. SimpleInjector with Verify() at start-up (ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs):91) and one scope per tick (:124-128); the MQ client is scoped to the tick, so a stale connection cannot be reused across ticks; overlapping ticks are prevented by the shared _tickLock in WindowsServiceHostBase.cs:372.
+• Data access. Stored procedures with typed parameters only, no SQL text built in C#; the update path does the right thing with Exito and throws with the folio in the message (OperacionesTomiDao.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Repositorios/OperacionesTomiDao.cs):69-72). Both procedures use TRY/CATCH, write to Auditoria.ErrorLog and re-THROW; the update procedure sets SET XACT_ABORT ON.
+• Exception hygiene. Every re-raise uses throw; (MQServicio.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MQServicio.cs):61-76, OperacionesTomiDao.cs:47, 78); the connect path catches the specific NMS exception types and maps them to actionable text (MapConnectionError.cs).
+• Messaging basics. Persistent delivery mode (MQServicio.cs:96), finally closing the connection on the send loop (OperacionServicio.cs:153-157), cancellation checked before every message (:139).
+• Secrets. No credential in source, config or tests; CALYPSO_MQ_USER/CALYPSO_MQ_PSW are read from the parameter table and the shared FileLogger masks both keys by name when the parameter loader logs Parámetro 'CALYPSO_MQ_PSW' = '...' (FileLogger.cs:59, EnmascararPorClavesSensibles), so the password is not written to the log even though the request does not declare it sensitive (CMT-FR-20).
+• Version-controlled database objects. Both procedures named by the constants exist under StoredProcedures\MWD_DB\DBMDW\CALYPSO\Calypso_inMT300\IT24\Procedures with headers, change control and matching parameter lists (@MaxRegistros; @Usuario, @Folio, @FechaOperacion), so the GEN-13 mismatch does not occur here.
+• Start-up contract. ValidarContratoInicializacion (shared base) rejects a missing PID/process name before the timer starts, so the unguarded Pid.Value in the host fails loudly rather than silently.
+• Hygiene. Compact solution (24 C# files, 1,408 lines), XML documentation on every public type, no Console/Debug output, build output git-ignored, a test project that targets the same framework and uses Moq.
+4. Findings by Project (low/no-dependency -> high dependency)
+Finding IDs use the prefix CMT-FR- (Calypso inMT300 - full review). Paths are relative to CALYPSO\Calypso_inMT300\ unless a stored-procedure file is named.
+4.1 Database layer - T-SQL procedures (outside the repository; lowest tier)
+Paths: 001 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/001%20SP%20sp_CinMT300_GetOperacionesMT300.sql) = sp_CinMT300_GetOperacionesMT300, 002 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/002%20SP%20usp_CinMT300_UpdMT300Procesado.sql) = usp_CinMT300_UpdMT300Procesado.
+MustChange / Rewrite
+CMT-FR-1 - The "read" procedure consumes every candidate message before anything is sent (Blocker) File: 001 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/001%20SP%20sp_CinMT300_GetOperacionesMT300.sql):97-123, 188-200, 210-225; OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):112-117, 134-152; Script_PruebaControlada.sql (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Scripts/Script_PruebaControlada.sql):10-32.
+Code block (sql)
+DECLARE aProcesar CURSOR FOR
+    SELECT NF_FOLIO, NF_MQ_MSG, CONVERT(VARCHAR, NF_FECHA_INICIO, 112)
+    FROM TB_SRV_SWF_TRABAJO
+    WHERE NF_CVE_MENSAJE = 'MT-300' AND NF_TIPO = 'SWIFT_IN' AND NF_MQ_MSG_ETL IS NULL ...
+      AND NF_FOLIO NOT IN (SELECT folio FROM tb_srv_swf_plan_trabajo_maestro
+                           WHERE cve_mensaje = 'MT-300' AND tipo_operacion = 'SWIFT_IN' ... AND cve_estatus = 'PROC')
+...
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    ...
+    UPDATE tb_srv_swf_plan_trabajo_maestro SET cve_estatus = 'PROC', ... WHERE folio = @Folio ...;   -- :188
+    UPDATE TB_SRV_SWF_TRABAJO SET NF_IMPRESION = '1' WHERE NF_FOLIO = @Folio;                      -- :198
+...
+IF @MaxRegistros > 0  SELECT TOP (@MaxRegistros) Folio, Mensaje, fechaTrade FROM #salida;           -- :210
+Issue: a procedure whose name says "Get" changes state. For every row of the eight-day window it flips the work-plan item to PROC and sets NF_IMPRESION = '1' *inside the loop*, before the service has published anything, and the NOT IN (... 'PROC') filter then hides those rows from every later call. The only thing that would make a row eligible again is NF_MQ_MSG_ETL IS NULL, but the next read excludes it through the PROC test. Therefore, whenever the work-plan row exists (the SP header says it is updated, so this is the normal case - *verify against data*):
+1. `@MaxRegistros` drops the rest. TOP (@MaxRegistros) is applied only to the final SELECT; all other candidates were already marked PROC. The committed script sets CALYPSO_MT300_MAX_REGISTROS = '5' for the "controlled test"; with that value in any environment that has more than five candidates, every message beyond the fifth is marked processed and never sent. The parameter is read with a silent default (CMT-FR-9), so nothing warns that it is still set.
+2. Any failure after the read loses the message. If the broker is down (ConectarAsync throws), the send throws, the process is stopped, or the host crashes, the rows are already PROC. The service only logs Validar manualmente (OperacionServicio.cs:150); there is no retry, no alert and no queue of "claimed but unsent" rows.
+3. Operators may lose sight of the item. The work-plan row appears to be the manual work queue (inferred from its name and from the cve_usuario_realizar = 'TOMI' assignment); marking it PROC with fec_fin = GETDATE() makes an unsent confirmation look completed.
+The C# code assumes the opposite contract (read = harmless, mark after send), which is why its comments and log messages talk about "actualizar manualmente".
+Fix (claim/confirm, minimal version): make the read a pure read and move the state change to the confirmation, so a failure leaves the row eligible:
+Code block (sql)
+-- sp_CinMT300_GetOperacionesMT300: SELECT TOP (NULLIF(@MaxRegistros, 0)) ... ORDER BY NF_FECHA_INICIO, NF_FOLIO;  -- no UPDATE
+-- usp_CinMT300_UpdMT300Procesado (one transaction, XACT_ABORT ON):
+UPDATE tb_srv_swf_plan_trabajo_maestro SET cve_estatus = 'PROC', ... WHERE folio = @Folio ...;
+UPDATE TB_SRV_SWF_TRABAJO SET NF_IMPRESION = '1', NF_HORA_AUTORIZACION = GETDATE(), OFS_AUTHOR = @Usuario,
+                              NF_MQ_MSG_ETL = 'EXITOSO' WHERE NF_FOLIO = @Folio ...;
+IF @@ROWCOUNT <> 1 THROW 50001, 'MT300 row not updated', 1;
+Because a failed mark after a successful publish would then re-send the message, set NMSCorrelationID/a message property to the folio and agree an idempotency rule with the Calypso owners (CMT-FR-16); if a stronger guarantee is needed use a SENDING claim with a timestamp that a sweeper returns to INI and alerts on (see GEN-18).
+Benefit: a stop, a broker outage or a send failure leaves confirmations pending instead of silently completed; @MaxRegistros becomes a real batch size. Suggested JIRA: CMT-1 (Blocker)
+CMT-FR-2 - One malformed message aborts the whole read after earlier rows were already marked (Major) File: 001 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/001%20SP%20sp_CinMT300_GetOperacionesMT300.sql):72, 123, 130-205, 230-264.
+Code block (sql)
+DECLARE @Mensaje VARCHAR(4000);                                           -- :72
+...
+SET @Existe1 = CHARINDEX(':30T:', @Paso);                                 -- :154  0 when the tag is absent
+SET @Paso2   = SUBSTRING(@Paso, @Existe1 + 5, 100);
+SET @Existe2 = CHARINDEX(':', @Paso2);                                    -- 0 when no tag follows
+SET @queFecha = RTRIM(SUBSTRING(@Paso2, 1, @Existe2 - 3));               -- :164  negative length -> error 536
+...
+END CATCH:  ... INSERT INTO Auditoria.ErrorLog ...; THROW;                -- :230-264, no per-row handling
+Issue: the loop has no per-row TRY/CATCH and no transaction. If a single message has no :30T: tag, or the tag is the last field, SUBSTRING receives a negative length and the whole procedure fails with error 536 in the CATCH, which drops #salida and rethrows. Rows processed earlier in the same call have already been updated to PROC (CMT-FR-1) and are now lost; the bad row itself was not yet marked, so it fails again on the next tick. Because the cursor is ordered by the string alias NF_FECHA_INICIO descending, rows that sort before the bad message are consumed and discarded on every tick, and rows after it are never reached while the message stays in the table. On the C# side the SqlException becomes an empty list (CMT-FR-12), so the only visible symptom is an INFO line saying nothing is pending. Related: @Mensaje VARCHAR(4000) silently truncates a longer NF_MQ_MSG (column type *verify*), and there is no NF_MQ_MSG IS NOT NULL filter, so a NULL message is returned and published as an empty text message (*verify* NMS behaviour for CreateTextMessage(null)).
+Fix: parse defensively and isolate each row.
+Code block (sql)
+SET @Existe1 = CHARINDEX(':30T:', @Mensaje);
+SET @queFecha = CASE WHEN @Existe1 > 0 THEN SUBSTRING(@Mensaje, @Existe1 + 5, 8) END;
+IF TRY_CONVERT(date, @queFecha, 112) IS NULL
+BEGIN  -- quarantine: mark the row ERR with a reason, write the audit row, continue with the next message
+    ...
+END
+Process rows set-based or inside a per-row BEGIN TRY ... END TRY so one bad message cannot affect the others; size @Mensaje to the source column (or VARCHAR(MAX)), filter NULL, and make the quarantine visible to operations (alert). Benefit: a bad message is isolated and reported instead of silently consuming every message ahead of it. Suggested JIRA: CMT-2 (Major)
+CMT-FR-3 - The key returned as `fechaTrade` is not the key the update matches on, and a zero-row update is reported as success (Major, verify) File: 001 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/001%20SP%20sp_CinMT300_GetOperacionesMT300.sql):154-170, 175-186, 220-224; 002 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/002%20SP%20usp_CinMT300_UpdMT300Procesado.sql):41-58; OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):144; OperacionesTomiDao.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Repositorios/OperacionesTomiDao.cs):54-72.
+Code block (sql)
+-- 001: returns the trade date parsed from tag :30T:
+INSERT INTO #salida (Folio, Mensaje, fechaTrade) VALUES (@Folio, @Salida, @queFecha);
+-- 002: matches on the job row's start date
+UPDATE TB_SRV_SWF_TRABAJO SET NF_HORA_AUTORIZACION = GETDATE(), OFS_AUTHOR = @Usuario, NF_MQ_MSG_ETL = 'EXITOSO'
+ WHERE NF_FOLIO = @Folio AND NF_CVE_MENSAJE = 'MT-300' AND NF_TIPO = 'SWIFT_IN'
+   AND CONVERT(VARCHAR, NF_FECHA_INICIO, 112) = @FechaOperacion;
+Code block (csharp)
+await _operacionesTomi.ActualizarMT300ProcesadoAsync(usuarioMQ, registro.Folio, registro.fechaTrade);   // :144
+Issue: the service passes registro.fechaTrade (the :30T: trade date, per the procedure header) as @FechaOperacion, and the update compares it with NF_FECHA_INICIO, the date the job row was created. Inside the read procedure the maestro update correctly uses the cursor's NF_FECHA_INICIO (@FECHA, :196), so the two procedures disagree about which date identifies a row. When a confirmation is created on a different day than its trade date (it arrives after midnight, after a weekend, or the deal is back-dated), the UPDATE matches zero rows. There is no @@ROWCOUNT check, the shared runner reports Exito, and the service logs "procesado correctamente" (OperacionServicio.cs:146). NF_MQ_MSG_ETL, NF_HORA_AUTORIZACION and OFS_AUTHOR stay NULL, so the audit trail says the message was never sent, and - depending on the CMT-FR-1 precondition - the message is either never marked (and may be re-sent every tick for up to eight days) or marked only in the work-plan table. Also, @Existe2 - 3 assumes a two-character line break after the date; a one-character break leaves a control character in @queFecha, and RTRIM removes only spaces. *Verify* with real data whether :30T: equals NF_FECHA_INICIO.
+Fix: return the job row's own key as a separate column (for example fechaOperacion = NF_FECHA_INICIO formatted 112), pass that to the update, and make the update fail loudly: IF @@ROWCOUNT <> 1 THROW 50001, 'MT300 folio/date not found', 1;. Keep fechaTrade only as information. Benefit: the mark either happens or raises an error the DAO already turns into an exception; no more "success" on zero rows. Suggested JIRA: CMT-3 (Major)
+Rewrite Recommended
+CMT-FR-4 - Procedure hygiene: row-by-row cursor, dead string builder, reserved prefix, deprecated types (Minor) File: 001 SP (../../StoredProcedures/MWD_DB/DBMDW/CALYPSO/Calypso_inMT300/IT24/Procedures/001%20SP%20sp_CinMT300_GetOperacionesMT300.sql):11, 62, 93, 97-205, 109-123, 141-173, 210-225.
+• Dead code. @Salida is assembled from {1:F01...}{2:O300...}{3:...}{4: (:141-152) and then overwritten by SET @Salida = @Mensaje; (:173, "Se conserva la lógica histórica"), and @Existe, @ExisteAnt and @Paso1 are declared and never used.
+• `TOP` without `ORDER BY` on #salida (:212): which rows a limited run returns is arbitrary.
+• Window and ordering. NF_FECHA_INICIO BETWEEN GETDATE() - 8 AND GETDATE() compares VARCHAR renderings and silently ignores any pending message older than eight days (for example after a long outage); ORDER BY NF_FECHA_INICIO DESC orders by the string alias, newest first, so older messages are starved when @MaxRegistros is set. Use ASC on the real datetime plus the folio as tie-breaker, and alert on rows that fall out of the window.
+• `NOT IN (subquery)` returns no rows at all if the subquery ever yields a NULL folio; use NOT EXISTS.
+• Row-by-row cursor plus a temp table with a deprecated TEXT column where a single set-based SELECT with TOP and one UPDATE ... OUTPUT would do.
+• Naming. The sp_ prefix makes SQL Server look in master first and is reserved by Microsoft guidance; the sibling uses usp_. The header says SISTEMA/BD: TOMI while the script targets [InterfacesT24] (confirm both are the same database).
+Fix: fold into the CMT-FR-1/2 rewrite; rename with usp_ and update ConstantesServicio.uspMT300Pendientes in the same release. Benefit: smaller, deterministic procedure that is cheaper to review and to test. Suggested JIRA: CMT-4 (Minor)
+4.2 Aplicacion_inMT300 (Tier 0)
+MustChange / Rewrite
+CMT-FR-5 - A failure to send or to mark is logged and nothing else: no alert, the rest of the batch is dropped, and the tick reports success (Major) File: OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):132-168; MQServicio.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MQServicio.cs):104-108.
+Code block (csharp)
+await _mQServicio.ConectarAsync(ct);
+try
 {
-    /// <summary>
-    /// Clase principal del servicio Windows (presentación).
-    /// </summary>
-    public partial class ServiceHost : ServiceBase
+    foreach (var registro in pendientes)
     {
-        private readonly string[] _startupArgs;
-
-        private SimpleInjector.Container _containerDI;
-        private Configuracion _configuracionBase;
-
-        private CancellationTokenSource _cts;
-
-        private Task _startupTask;
-
-        private TcpListener _tcpListener;
-        private Task _listenerTask;
-
-        private static int _workerSequence;
-        private static int _peticionSequence;
-        private SemaphoreSlim _limiteConcurrencia;
-
-        /// <summary>
-        /// Constructor.
-        /// </summary>
-        public ServiceHost() : this(null) { }
-
-        public ServiceHost(string[] startupArgs)
-        {
-            _startupArgs = startupArgs;
-        }
-
-        /// <summary>
-        /// OnStart de contrato, usado para correr la Inicializacion y ParametrizacionesAsync.
-        /// Sin bloquear OnStart (no puede ser async por contrato).
-        /// </summary>
-        protected override void OnStart(string[] args)
-        {
-            //Ejecuta la inicialización...
-            _cts = new CancellationTokenSource();
-
-            string[] effectiveArgs = (args != null && args.Length > 0) ? args : _startupArgs;
-
-            Inicializacion(effectiveArgs, _cts.Token);
-            _startupTask = ParametrizacionesAsync(_cts.Token);
-
-
-
-            _startupTask.ContinueWith(t =>
-            {
-                if (t.IsFaulted)
-                {
-                    var ex = t.Exception;
-
-                    Log($"ERROR|OnStart|{ex}");
-
-                    this.ExitCode = 1;
-                    this.Stop();
-                    return;
-                }
-            }, TaskScheduler.Default);
-        }
-
-        /// <summary>
-        /// Utiles para poder hacer debug en asyc.
-        /// </summary>
-#if DEBUG
-        public void DebugRun(string[] args)
-        {
-            OnStart(args);
-            Log("Servicio iniciado en modo DEBUG. Presiona ENTER para detener...");
-            Console.ReadLine();
-            OnStop();
-        }
-#endif
-
-        /// <summary>
-        /// Realiza la obtención de la configuración del servicio 
-        /// y la inyección de dependencias.
-        /// </summary>
-        protected void Inicializacion(string[] args, CancellationToken ct)
-        {
-            ct.ThrowIfCancellationRequested();
-            string proceso = (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
-                ? args[0]
-                : "Default";
-
-            string NombreServicioConector = ObtenerNombreServicioConector(proceso);
-            string TipoServicio = NombreServicioConector.Replace("Conector_", "");
-
-            //Objeto que almacena la configuración necesaria para el funcionamiento del servicio...
-            _configuracionBase = new Configuracion();
-
-            //Inicializa la obtención de la configuración general y las rutas del log...
-            {
-                ConfiguracionEncriptadaHelper.Inicializar();
-                ServicioConfiguracionSettings servicioMainConfiguracion = ConfiguracionEncriptadaHelper.ObtenerServicio(NombreServicioConector);
-                _configuracionBase.NombreServicio = servicioMainConfiguracion.NombreServicio;
-                _configuracionBase.RutaArchivoConfiguracion = $@"{EnumRutasGenerales.Path_Log_CMS}\{NombreServicioConector}\";
-                _configuracionBase.PathLog = servicioMainConfiguracion.Log + servicioMainConfiguracion.NombreServicio;
-                _configuracionBase.configuracion = servicioMainConfiguracion.configuracion;
-                _configuracionBase.TamanoMaximoArchivoLogKB = servicioMainConfiguracion.TamanoMaximoArchivoLogKB.ToString();
-                _configuracionBase.ForzaEjecucionServicios = servicioMainConfiguracion.ForzaEjecucionServicios;
-                _configuracionBase.LimiteConcurrencia = servicioMainConfiguracion.LimiteConcurrencia;
-                _configuracionBase.AceptaDiferenciaEnFechas = servicioMainConfiguracion.AceptaDiferenciaEnFechas;
-                _configuracionBase.SwiftStandardReleaseSanitized = servicioMainConfiguracion.SwiftStandardReleaseSanitized;
-
-                Logging.Init(_configuracionBase.PathLog, servicioMainConfiguracion.NombreServicio, servicioMainConfiguracion.TamanoMaximoArchivoLogKB);
-                LoggingConector.EscribirLog($"{ConstantesServicio.INFO}|El servicio atendera solicitudes '{TipoServicio}'.");
-
-            }
-
-            //Realiza la configuracion del contenedor DI...
-            _containerDI = new SimpleInjector.Container();
-            _containerDI.Options.DefaultScopedLifestyle = new AsyncScopedLifestyle();
-            _containerDI.Register<IAlertas>(() => new Alertas(BasedatosProveedor.SqlServer, NombreBasedatos.TOMI, null, null), Lifestyle.Singleton);
-            _containerDI.Register<IControlServicio, ControlServicio>();
-            _containerDI.Register<MUFG_T24.Interfaces_utilidades.IParametrizacion, MUFG_T24.Inicializacion_utilidades.Parametrizacion>();
-
-            //Registra la configuracion...
-            _containerDI.Register<Configuracion>(() => _configuracionBase.Clone(), Lifestyle.Scoped);
-            //Registra los componentes del servicio...
-            _containerDI.Register<IRequestProcessor, RequestProcessor>(Lifestyle.Scoped);
-
-            _containerDI.Register<IHSMService, HSMService>(Lifestyle.Scoped);
-            _containerDI.Register<Func<IHSMService>>(() => () => _containerDI.GetInstance<IHSMService>(), Lifestyle.Scoped);
-            _containerDI.Register<IHsmClient, HsmTcpClient>(Lifestyle.Scoped);
-            _containerDI.Register<IHsmConfig, HsmConfig>(Lifestyle.Singleton);
-
-            _containerDI.Register<IRSASoapClient, RSASoapClient>(Lifestyle.Scoped);
-            _containerDI.Register<IRSAAdminService, RSAAdminService>(Lifestyle.Scoped);
-
-            _containerDI.Register<IRSATokenService, RSATokenService>(Lifestyle.Scoped);
-            _containerDI.Register<IRSAAuthenticationService, RSAAuthenticationService>(Lifestyle.Scoped);
-            _containerDI.Register<IRSASynchronizationService, RSASynchronizationService>(Lifestyle.Scoped);
-
-            _containerDI.Register<IRSAEncrypt, RSAUtilEncrypt>(Lifestyle.Scoped);
-            _containerDI.Register<IEncryptionService, TripleDesEncryptionService>(Lifestyle.Scoped);
-            _containerDI.Register<IRSAService, RSAService>(Lifestyle.Scoped);
-            _containerDI.Register<Func<IRSAService>>(() => () => _containerDI.GetInstance<IRSAService>(), Lifestyle.Scoped);
-
-            _containerDI.Verify();
-        }
-
-        /// <summary>
-        /// Realiza la obtención inicial de parámetros (una sola vez).
-        /// PENDIENTE: Poner parametrizaciones
-        /// </summary>
-        private async Task ParametrizacionesAsync(CancellationToken ct)
-        {
-            try
-            {
-                ct.ThrowIfCancellationRequested();
-
-                //Marca el servicio en uso...
-                IParametrizacion _parametrizacion = _containerDI.GetInstance<IParametrizacion>();
-                _configuracionBase = await _parametrizacion.ObtenerProcesoActualAsync(_configuracionBase);
-                _configuracionBase.ParametrosSistema = await _parametrizacion.ObtenerParametrosSistemaAsync(ConstantesServicio.ParametrosSistema);
-
-                int limiteConcurrencia = _configuracionBase.LimiteConcurrencia ?? 5;
-                _limiteConcurrencia = new SemaphoreSlim(limiteConcurrencia, limiteConcurrencia);
-
-                IControlServicio _controlServicio = _containerDI.GetInstance<IControlServicio>();
-                await _controlServicio.MarcarPuertoEnUsoAsync(_configuracionBase.Pid.Value, _configuracionBase.NombreProceso, _configuracionBase.NombreDisplay, _configuracionBase.NombreServicio);
-
-                _configuracionBase.PuertoTCP = await _parametrizacion.ObtenerPuertos(_configuracionBase.NombreServicio, _configuracionBase.Pid.Value);
-
-                //Comienza el escuchador TCP...
-                _listenerTask = TcpListenerStartAsync(int.Parse(_configuracionBase.PuertoTCP), ct);
-
-                _ = _listenerTask.ContinueWith(t =>
-                {
-                    LoggingConector.EscribirLog($"ERROR|TcpListenerStartAsync|{t.Exception}");
-                    ExitCode = 1;
-                    Stop();
-                },
-                TaskContinuationOptions.OnlyOnFaulted);
-            }
-            catch (OperationCanceledException exc)
-            {
-                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeParametrizaciones}|{exc}");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeParametrizaciones}|{ex}");
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// Establece el TCP listener.
-        /// </summary>
-        /// 
-        private async Task TcpListenerStartAsync(int puerto, CancellationToken token)
-        {
-            _tcpListener = new TcpListener(IPAddress.Any, puerto);
-            _tcpListener.Start();
-
-            Log($"Listener TCP activo en {IPAddress.Any}:{puerto}");
-
-            try
-            {
-                using (token.Register(() => { try { _tcpListener.Stop(); } catch { } }))
-                {
-                    while (!token.IsCancellationRequested)
-                    {
-                        TcpClient client = null;
-                        try
-                        {
-                            client = await _tcpListener.AcceptTcpClientAsync().ConfigureAwait(false);
-                        }
-                        catch (SocketException ex) when (token.IsCancellationRequested)
-                        {
-                            Log($"ERROR|TcpListenerStartAsync|SocketException|{ex}");
-                        }
-                        catch (ObjectDisposedException) when (token.IsCancellationRequested) { break; }
-                        catch (Exception ex)
-                        {
-                            Log($"ERROR|TcpListenerStartAsync|{ex}");
-                            throw;
-                        }
-
-                        if (client == null)
-                        {
-                            continue;
-                        }
-
-                        var dispatcherTask = DispatcherAsync(client, token);
-                        await dispatcherTask.ContinueWith(t =>
-                        {
-                            if (t.IsFaulted)
-                            {
-                                Log($"ERROR|DispatcherAsync|{t.Exception}");
-                            }
-                        }, TaskScheduler.Default);
-                    }
-                }
-            }
-            finally
-            {
-                Log($"INFO|Termina Solicitud.");
-            }
-        }
-
-        /// <summary>
-        /// Manejador que controla la concurrencia para determinr si puede procesar una petición o agregarla a la cola.
-        /// </summary>
-        private async Task DispatcherAsync(TcpClient cliente, CancellationToken token)
-        {
-
-            await _limiteConcurrencia.WaitAsync(token);
-            try
-            {
-                await ProcesarClienteAsync(cliente, token);
-            }
-            finally
-            {
-                _limiteConcurrencia.Release();
-            }
-        }
-
-        /// <summary>
-        /// Interpreta la petición.
-        /// </summary>
-        private async Task ProcesarClienteAsync(TcpClient cliente, CancellationToken token)
-        {
-            using (cliente)
-            using (var stream = cliente.GetStream())
-            {
-                var remoteIp = ((IPEndPoint)cliente.Client.RemoteEndPoint).Address;
-                string clienteOrigen = remoteIp.ToString();
-
-                string contextoConector = null;
-
-                if (!ClientePermitido(clienteOrigen))
-                {
-                    Log($"INFO|{clienteOrigen}|ProcesarClienteAsync|La IP '{clienteOrigen}' no es valida para establecer conexión, será rechazada por la petición.");
-
-                    cliente.Close();
-                    return;
-                }
-
-                try
-                {
-                    string request = await LeerSolicitudTextoAsync(stream, token).ConfigureAwait(false);
-                    contextoConector = CrearContextoConector(clienteOrigen, request);
-
-                    using (LoggingConector.BeginContexto(contextoConector))
-                    {
-                        Log($"INFO|REQUEST|{clienteOrigen}|{request}");
-
-                        string response;
-
-                        using (AsyncScopedLifestyle.BeginScope(_containerDI))
-                        {
-                            var processor = _containerDI.GetInstance<IRequestProcessor>();
-
-                            response = await processor.ProcesarPeticionAsync(clienteOrigen, request);
-
-                        }
-
-                        Log($"INFO|RESPONSE|{clienteOrigen}|{response}");
-
-                        await EnviarRespuestaPlanoAsync(stream, response, token);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    using (LoggingConector.BeginContexto(contextoConector))
-                    {
-                        Log($"ERROR|ProcesarCliente|{clienteOrigen}|{ex}");
-                    }
-
-                    await EnviarRespuestaPlanoAsync(stream, "9", token);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Método para imprimir Log.
-        /// </summary>
-        /// <param name="mensaje"></param>
-        private void Log(string mensaje)
-        {
-            LoggingConector.EscribirLog(mensaje);
-            Console.WriteLine(mensaje);
-        }
-
-        /// <summary>
-        /// Crea un contexto único por petición del conector (logging especial del conector).
-        /// </summary>
-        private static string CrearContextoConector(string clienteOrigen, string solicitud)
-        {
-            int workerId = Interlocked.Increment(ref _workerSequence);
-            int peticionId = Interlocked.Increment(ref _peticionSequence);
-            string tipo = ObtenerTipoSolicitud(solicitud);
-            string origen = string.IsNullOrWhiteSpace(clienteOrigen) ? "N/A" : clienteOrigen.Trim();
-
-            return string.Format(
-                CultureInfo.InvariantCulture,
-                "[W:CNT-W{0:0000}][Peticion:CNT-P{1:0000}][Tipo:{2}][Cliente:{3}]",
-                workerId,
-                peticionId,
-                tipo,
-                origen);
-        }
-        /// <summary>
-        /// Método para obtener tipo de Solicitud.
-        /// </summary>
-        /// <param name="solicitud"></param>
-        /// <returns></returns>
-        private static string ObtenerTipoSolicitud(string solicitud)
-        {
-            if (string.IsNullOrWhiteSpace(solicitud) || solicitud.Length < 3)
-                return "N/A";
-
-            string tipo = solicitud.Substring(0, 3).Trim().ToUpperInvariant();
-            return tipo == ConstantesServicio.TIPO_SOLICITUD_RSA ||
-                   tipo == ConstantesServicio.TIPO_SOLICITUD_HSM ||
-                   tipo == ConstantesServicio.TIPO_SOLICITUD_SSO
-                ? tipo
-                : "N/A";
-        }
-        /// <summary>
-        /// Método para enviar respuesta
-        /// </summary>
-        /// <param name="stream"></param>
-        /// <param name="respuesta"></param>
-        /// <param name="ct"></param>
-        /// <returns></returns>
-        private async Task EnviarRespuestaPlanoAsync(NetworkStream stream, string respuesta, CancellationToken ct)
-        {
-            try
-            {
-                byte[] data = Encoding.ASCII.GetBytes(respuesta);
-                string length = data.Length.ToString().PadLeft(6, '0');
-
-                byte[] lengthBytes = Encoding.ASCII.GetBytes(length);
-
-                await stream.WriteAsync(lengthBytes, 0, lengthBytes.Length, ct).ConfigureAwait(false);
-                await stream.WriteAsync(data, 0, data.Length, ct).ConfigureAwait(false);
-                await stream.FlushAsync(ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                Log($"ERROR|EnviarRespuestaPlanoAsync|{ex}");
-            }
-        }
-
-        /// <summary>
-        /// Realiza ciertas operaciones antes de finalizar el servicio.
-        /// </summary>
-        private async Task TerminacionAsync(CancellationToken ct)
-        {
-            Log(ConstantesServicio.MensajeTerminacion);
-
-            try
-            {
-                //Espera los tasks que se esten ejecutando...
-                int max = _configuracionBase.LimiteConcurrencia ?? 5;
-                for (int i = 0; i < max; i++)
-                {
-                    bool obtenido = await _limiteConcurrencia.WaitAsync(TimeSpan.FromSeconds(20), ct);
-
-                    if (!obtenido)
-                    {
-                        Log("WAR|Timeout esperando peticiones activas.");
-                        break;
-                    }
-                }
-
-                using (AsyncScopedLifestyle.BeginScope(_containerDI))
-                {
-                    Configuracion _configuracion = _containerDI.GetInstance<Configuracion>();
-                    IControlServicio _controlServicio = _containerDI.GetInstance<IControlServicio>();
-
-                    await _controlServicio.MarcarPuertoEnUsoAsync(null, null, null, _configuracion.NombreServicio);
-                    await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio);
-                }
-
-                LoggingConector.EscribirLog(ConstantesServicio.MensajeTerminacionExitosa);
-            }
-            catch (OperationCanceledException exc)
-            {
-                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeOperationCanceledException}|{exc}");
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"{ConstantesServicio.MensajeException}|{ex}");
-            }
-        }
-
-
-
-
-        /// <summary>
-        /// Método para obtener el nombre del servicio conector
-        /// </summary>
-        /// <param name="proceso"></param>
-        /// <returns></returns>
-        /// <exception cref="ArgumentException"></exception>
-        private static string ObtenerNombreServicioConector(string proceso)
-        {
-            if (string.IsNullOrWhiteSpace(proceso))
-            {
-                throw new ArgumentException(nameof(proceso));
-            }
-
-            switch (proceso.Trim().ToUpperInvariant())
-            {
-                case ConstantesServicio.PROCESO_HSM:
-                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_HSM;
-                case ConstantesServicio.PROCESO_RSA_ADMIN:
-                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_RSA_ADMIN;
-                case ConstantesServicio.PROCESO_RSA_AUTH:
-                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_RSA_AUTH;
-                case ConstantesServicio.PROCESO_RSA_SYNC:
-                    return ConstantesServicio.NOMBRE_SERVICIO_CONECTOR_RSA_SYNC;
-
-                default:
-                    throw new ArgumentException($"Proceso no soportado: {proceso}", nameof(proceso));
-            }
-        }
-
-        /// <summary>
-        /// Método para validar cliente permitido
-        /// </summary>
-        /// <param name="direccionCliente"></param>
-        /// <param name="clienteOrigen"></param>
-        /// <returns></returns>
-        private bool ClientePermitido(string direccionCliente)
-        {
-            string ListaDirecciones = ObtenerValor(ConstantesServicio.CONECTORCLIENTES, x => x);
-            if (string.IsNullOrWhiteSpace(direccionCliente))
-            {
-                return false;
-            }
-            if (!IPAddress.TryParse(direccionCliente, out _))
-            {
-                return false;
-            }
-            return ($",{ListaDirecciones},").Contains($",{direccionCliente},");
-        }
-
-        /// <summary>
-        /// Metodo para obtener valor de parametros de configuracion de MQ.
-        /// </summary>
-        /// <typeparam name="T"></typeparam>
-        /// <param name="clave"></param>
-        /// <param name="parser"></param>
-        /// <param name="defaultValue"></param>
-        /// <returns></returns>
-        T ObtenerValor<T>(string clave, Func<string, T> parser, T defaultValue = default)
-        {
-            if (_configuracionBase.ParametrosSistema.TryGetValue(clave, out var valor))
-                return parser(valor);
-
-            LoggingConector.EscribirLog($"INFO|ObtenerValor|Clave no encontrada en BD: {clave}");
-            return defaultValue;
-        }
-
-        protected async Task<byte[]> ReadExactAsync(NetworkStream stream, int length, CancellationToken ct)
-        {
-            try
-            {
-                byte[] buffer = new byte[length];
-                int read;
-                for (int offset = 0; offset < length; offset += read)
-                {
-                    read = await stream.ReadAsync(buffer, offset, length - offset, ct).ConfigureAwait(continueOnCapturedContext: false);
-                    if (read == 0)
-                    {
-                        throw new IOException("Cliente cerró la conexión");
-                    }
-                }
-
-                return buffer;
-            }
-            catch (Exception ex)
-            {
-                throw new IOException("Error durante la recepción de datos desde el socket.", ex);
-            }
-
-        }
-
-        /// <summary>
-        /// OnStop de contrato, usado para correr TerminacionAsync en async.
-        /// Sin bloquear OnStop (no puede ser async por contrato).
-        /// </summary>
-        protected override void OnStop()
-        {
-            try
-            {
-                //Señaliza cancelación...
-                _tcpListener?.Stop();
-                _cts?.Cancel();
-
-                if (_listenerTask != null)
-                {
-                    Task.WaitAny(_listenerTask, Task.Delay(5000));
-                }
-
-                //Ejecuta la terminacíón...
-                CancellationToken token = _cts?.Token ?? CancellationToken.None;
-                Task.WaitAny(TerminacionAsync(token), Task.Delay(TimeSpan.FromSeconds(25)));
-            }
-            catch (Exception ex)
-            {
-                Log($"ERROR|OnStop|{ex}");
-            }
-            finally
-            {
-                _limiteConcurrencia?.Dispose();
-                _cts?.Dispose();
-            }
-
-        }
-
-        public static int ParseEnteroRequerido(string valor, string nombreCampo)
-        {
-            if (string.IsNullOrWhiteSpace(valor))
-            {
-                throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' porque viene vacío.");
-            }
-
-            if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result))
-            {
-                return result;
-            }
-
-            throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' con valor '" + valor + "' a Int32.");
-        }
-
-        private async Task<string> LeerSolicitudTextoAsync(NetworkStream stream, CancellationToken ct)
-        {
-            byte[] buffer = new byte[4096];
-
-            using (var ms = new MemoryStream())
-            {
-                while (true)
-                {
-                    int read = await stream.ReadAsync(buffer, 0, buffer.Length, ct).ConfigureAwait(false);
-
-                    if (read == 0)
-                    {
-                        if (ms.Length == 0)
-                        {
-                            throw new IOException("Cliente cerró la conexión");
-                        }
-
-                        break;
-                    }
-
-                    ms.Write(buffer, 0, read);
-
-                    if (!stream.DataAvailable)
-                    {
-                        await Task.Delay(10, ct).ConfigureAwait(false);
-
-                        if (!stream.DataAvailable)
-                        {
-                            break;
-                        }
-                    }
-                }
-
-                string solicitud = Encoding.ASCII.GetString(ms.ToArray());
-                return solicitud.TrimEnd('\0', '\r', '\n');
-            }
-        }
+        ct.ThrowIfCancellationRequested();                                   // :139
+        await _mQServicio.EnviarMensajeAsync(colaMQ, registro, ct);          // :142
+        await _operacionesTomi.ActualizarMT300ProcesadoAsync(usuarioMQ, registro.Folio, registro.fechaTrade);
     }
 }
-
-using AplicacionConector.DTOs;
-using AplicacionConector.Enums;
-using AplicacionConector.Interfaces;
-using AplicacionConector.Utilidades;
-using MUFG_T24.Comunes;
-using System;
-using System.Net.Sockets;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using System.Xml;
-
-namespace InfraestructuraConector.SOAP
+catch(Exception ex)                                                          // :148
 {
-    /// <summary>
-    /// Clase para sincronización de servicio RSA.
-    /// </summary>
-    public class RSASynchronizationService
-        : IRSASynchronizationService
-    {
-        private readonly IRSASoapClient _rsaClient;
-        private readonly IRSATokenService _tokenService;
-        /// <summary>
-        /// Constructor
-        /// </summary>
-        /// <param name="rsaClient"></param>
-        /// <param name="tokenService"></param>
-        public RSASynchronizationService(IRSASoapClient rsaClient,IRSATokenService tokenService)
-        {
-            _rsaClient = rsaClient;
-            _tokenService = tokenService;
-        }
-        /// <summary>
-        /// Método para sincronizar token RSA.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="tokenSn"></param>
-        /// <param name="tokenCode1"></param>
-        /// <param name="tokenCode2"></param>
-        /// <returns></returns>
-        public async Task<EstatusRegreso> SincronizarAsync(string clienteOrigen,string tokenSn,string tokenCode1,string tokenCode2)
-        {
-            try
-            {
-                TokenUserInfo tokenInfo = await _tokenService.ObtenerInformacionTokenAsync(clienteOrigen, tokenSn);
-
-                if (tokenInfo == null)
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSASynchronizationService|El TokenUserInfo es nullo .");
-                    return EstatusRegreso.ErrorGeneral;
-                }
-
-                if (tokenInfo.Estatus != EstatusRegreso.OK)
-                    return tokenInfo.Estatus;
-
-                if (string.IsNullOrWhiteSpace(tokenInfo.UserId))
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSASynchronizationService|El token[{tokenSn}] no está asociado a ningun usuario.");
-                    return EstatusRegreso.ErrorGeneral;
-                }
-
-                if (!tokenInfo.Enabled)
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSAAuthenticationService|Token deshabilitado.");
-                    return EstatusRegreso.AccesoDenegado;
-                }
-
-                if (!tokenInfo.UserEnabled)
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSAAuthenticationService|Usuario deshabilitado.");
-                    return EstatusRegreso.AccesoDenegado;
-                }
-
-                if (tokenInfo.UserLocked)
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSAAuthenticationService|Usuario bloqueado.");
-                    return EstatusRegreso.AccesoDenegado;
-                }
-
-                if (tokenCode2 == "0") 
-                    return EstatusRegreso.OK;                
-
-                string xml = RSAXmlBuilder.BuildResync(tokenSn,tokenCode1,tokenCode2);
-
-                string response = _rsaClient.Resync(xml);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.RSASynchronizationService|Token='{tokenCode1}'. Se recibe respuesta del WS=" + XMLToTexto(response ?? string.Empty));
-
-                string lsTrnResCode = string.Empty;
-                string lsTrnResMsg = string.Empty;
-                string valorMSG = string.Empty;
-
-                return EsValidoAnalisXml(ref response, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG) ? EstatusRegreso.OK : EstatusRegreso.ErrorGeneral;
-                
-            }
-            catch (TimeoutException ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|TIMEOUT_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
-
-                return EstatusRegreso.ErrorGeneral;
-            }
-            catch (XmlException ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|PROTOCOL_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
-
-                return EstatusRegreso.ErrorGeneral;
-            }
-            catch (SocketException ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|DEPENDENCY_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
-
-                return EstatusRegreso.ErrorGeneral;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|UNEXPECTED_ERROR|{clienteOrigen}|RSASynchronizationService|{ex}");
-
-                return EstatusRegreso.ErrorGeneral;
-            }
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="textoXML"></param>
-        /// <returns></returns>
-        private string XMLToTexto(string textoXML)
-        {
-            return Regex.Replace(
-                textoXML
-                .Replace("\r\n", "")
-                .Replace("\r", "")
-                .Replace("\n", "")
-                .Replace("\t", ""),
-                " {2,}",
-                " ");
-        }
-
-        /// <summary>
-        /// Método para validación de formato XML.
-        /// </summary>
-        /// <param name="textXML"></param>
-        /// <param name="trnResCode"></param>
-        /// <param name="trnResMsg"></param>
-        /// <param name="valorMSG"></param>
-        /// <returns></returns>
-        private bool EsValidoAnalisXml(ref string textXML, ref string trnResCode, ref string trnResMsg, ref string valorMSG)
-        {
-            XmlElement loXMLElement;
-            XmlElement loXMLSubElement;
-
-            XmlDocument loXMLDoc;
-            string error;
-
-            if (!XmlHelper.TryParseXmlSeguro(textXML, out loXMLDoc, out error))
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                LoggingConector.EscribirLog($"ERROR|RSASynchronizationService|XML inválido: {error}");
-                return false;
-            }
-
-            loXMLElement = loXMLDoc["SERVICE_RESPONSE"];
-
-            if (loXMLElement == null)
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            loXMLElement = loXMLElement["TRANSACTION_RESPONSE"];
-
-            if (loXMLElement == null)
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            trnResCode = loXMLElement.Attributes?["trnResCode"]?.Value;
-            trnResMsg = loXMLElement.Attributes?["trnResMsg"]?.Value;
-
-            if (string.IsNullOrWhiteSpace(trnResCode) || string.IsNullOrWhiteSpace(trnResMsg))
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            if (trnResCode == "0" && trnResMsg == "Success")
-            {
-                loXMLElement = loXMLElement["TOKEN_ADMIN_RESPONSE"];
-
-                if (loXMLElement == null)
-                    return false;
-
-                loXMLSubElement = loXMLElement["STATUS"];
-
-                if (loXMLSubElement == null)
-                    return false;
-
-                if (loXMLSubElement.InnerText == "0")
-                {
-                    loXMLSubElement = loXMLElement["MSG"];
-
-                    if (loXMLSubElement != null)
-                    {
-                        valorMSG = loXMLSubElement.InnerText;
-                    }
-                    return true;
-                }
-                return false;
-            }
-            return false;
-        }
-    }
+    _appLogger.Log(TipoLog.ERROR, $"Se presenta excepción al enviar o actualizar mensaje, Validar manualmente. | Mensaje: {ex.Message}");
 }
-
-using AplicacionConector.DTOs;
-using AplicacionConector.Enums;
-using AplicacionConector.Interfaces;
-using AplicacionConector.Utilidades;
-using MUFG_T24.Comunes;
-using System;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using System.Xml;
-
-namespace InfraestructuraConector.SOAP
+finally { await _mQServicio.DesconectarAsync(); ... }
+Issue: the single catch around the whole loop (1) logs only ex.Message through Log - there is no ManejarErrorAsync, so, unlike a connect failure, no alert row is created for the most important failure the service can have (a message that was not delivered or whose mark failed); (2) abandons every remaining record of the batch after the first failure; (3) does not rethrow, so RealizaOperaciones returns normally and EjecutarProcedimientosAsync goes on to ActualizaTerminacion and returns true (CMT-FR-6); (4) catches the OperationCanceledException raised by ct.ThrowIfCancellationRequested() at :139, logging a normal stop as ERROR ... Validar manualmente, so the outer catch (OperationCanceledException) at :161 can only fire for ConectarAsync; (5) the same failure is logged twice (MQServicio.cs:106 adds the full payload, CMT-FR-14) and the stack trace is lost in this copy. Given the database contract (CMT-FR-1) a failed record is currently not retried at all, and once CMT-FR-1 is fixed the same code would let one permanently failing record block every record behind it on every tick.
+Fix: handle each stage separately, keep the loop moving for send failures, stop for mark failures, always alert, and return an outcome.
+Code block (csharp)
+foreach (var registro in pendientes)
 {
-    /// <summary>
-    /// Clase para implementar métodos Token.
-    /// </summary>
-    public class RSATokenService : IRSATokenService
+    ct.ThrowIfCancellationRequested();
+    try { await _mQServicio.EnviarMensajeAsync(colaMQ, registro, ct); }
+    catch (Exception ex) when (!(ex is OperationCanceledException))
     {
-        private readonly IRSASoapClient _rsaClient;
-        private readonly IRSAEncrypt _rsaEncript;
-        /// <summary>
-        /// Constructor Token
-        /// </summary>
-        /// <param name="rsaClient"></param>
-        /// <param name="rsaEncript"></param>
-        public RSATokenService(IRSASoapClient rsaClient, IRSAEncrypt rsaEncript)
-        {
-            _rsaClient = rsaClient;
-            _rsaEncript = rsaEncript;
-        }
-        /// <summary>
-        /// Método para obtener Información Token.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="tokenSn"></param>
-        /// <returns></returns>
-        public async Task<TokenUserInfo> ObtenerInformacionTokenAsync(string clienteOrigen, string tokenSn)
-        {
-            string lsEntrada = string.Empty;
-            string lsRegreso = string.Empty;
-            string lsTrnResCode = string.Empty;
-            string lsTrnResMsg = string.Empty;
-            string valorMSG = string.Empty;
-            var tokenInfo = new TokenUserInfo();
-
-            try
-            {
-                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
-                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
-                lsRegreso = _rsaClient.TokenInfo(lsEntrada);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.obtener_info_tokenUser|Al buscar propiedades del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso));
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    tokenInfo.Estatus = lsTrnResCode == ConstantesServicio.TokenInexistenteCode ? EstatusRegreso.TokenInexistente : EstatusRegreso.ErrorGeneral;
-                    return tokenInfo;
-                }
-
-                string[] datos = valorMSG.Split('/');
-
-                tokenInfo.Estatus = EstatusRegreso.OK;
-                tokenInfo.TokenSerialNumber = tokenSn;
-                tokenInfo.Active = true;
-
-                if (datos.Length > 0)
-                    tokenInfo.Enabled = datos[0] == "1";
-
-                if (datos.Length > 1)
-                    tokenInfo.PinMode = datos[1] == "1";
-
-                if (datos.Length > 2)
-                    tokenInfo.NextTokenCode = datos[2] == "1";
-
-                if (datos.Length > 3)
-                    tokenInfo.UserId = datos[3];
-
-                if (string.IsNullOrWhiteSpace(tokenInfo.UserId))
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.obtener_info_tokenUser|El token='{tokenSn}' no está asociado a ningún usuario.");
-                    return tokenInfo;
-                }
-
-                string UsuarioIDEncript = _rsaEncript.Encrypt(tokenInfo.UserId);
-                lsEntrada = GenerarXmlTokenAdmin(UsuarioIDEncript, string.Empty, string.Empty, string.Empty);
-                lsRegreso = _rsaClient.GetUserInfo(lsEntrada);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.obtener_info_tokenUser|Al buscar propiedades del ususario='{tokenInfo.UserId}'. Se reciberespuesta WS={XMLToTexto(lsRegreso)}");
-
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                if (EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    datos = valorMSG.Split('/');
-                    if (datos.Length > 0)
-                        tokenInfo.UserName = datos[0];
-
-                    if (datos.Length > 1)
-                        tokenInfo.UserEnabled = datos[1] == "1";
-
-                    if (datos.Length > 2)
-                        tokenInfo.UserLocked = datos[2] == "1";
-                }
-                else {
-                    LoggingConector.EscribirLog($"WARN|{clienteOrigen}|RSA.obtener_info_tokenUser|No fue posible obtener la información del usuario. Código={lsTrnResCode}");
-                    tokenInfo.Estatus = EstatusRegreso.ErrorGeneral;
-                }
-
-                return tokenInfo;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.obtener_info_tokenUser|{ex}");
-                tokenInfo.Estatus = EstatusRegreso.ErrorGeneral;
-
-                return tokenInfo;
-            }
-        }
-
-        #region ValidacionXml
-        /// <summary>
-        /// Método para validar XML.
-        /// </summary>
-        /// <param name="textXML"></param>
-        /// <param name="trnResCode"></param>
-        /// <param name="trnResMsg"></param>
-        /// <param name="valorMSG"></param>
-        /// <returns></returns>
-        private bool EsValidoAnalisXml(ref string textXML, ref string trnResCode, ref string trnResMsg, ref string valorMSG)
-        {
-            XmlElement loXMLElement;
-            XmlElement loXMLSubElement;
-
-            XmlDocument loXMLDoc;
-            string error;
-
-            if (!XmlHelper.TryParseXmlSeguro(textXML, out loXMLDoc, out error))
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                LoggingConector.EscribirLog($"ERROR|RSATokenService|XML inválido: {error}");
-                return false;
-            }
-
-            loXMLElement = loXMLDoc["SERVICE_RESPONSE"];
-
-            if (loXMLElement == null)
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            loXMLElement = loXMLElement["TRANSACTION_RESPONSE"];
-
-            if (loXMLElement == null)
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            trnResCode = loXMLElement.Attributes?["trnResCode"]?.Value;
-            trnResMsg = loXMLElement.Attributes?["trnResMsg"]?.Value;
-
-            if (string.IsNullOrWhiteSpace(trnResCode) || string.IsNullOrWhiteSpace(trnResMsg))
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            if (trnResCode == "0" && trnResMsg == "Success")
-            {
-                loXMLElement = loXMLElement["TOKEN_ADMIN_RESPONSE"];
-
-                if (loXMLElement == null)
-                    return false;
-
-                loXMLSubElement = loXMLElement["STATUS"];
-
-                if (loXMLSubElement == null)
-                    return false;
-
-                if (loXMLSubElement.InnerText == "0")
-                {
-                    loXMLSubElement = loXMLElement["MSG"];
-
-                    if (loXMLSubElement != null)
-                    {
-                        valorMSG = loXMLSubElement.InnerText;
-                    }
-                    return true;
-                }
-                return false;
-            }
-            return false;
-        }
-        /// <summary>
-        /// Validación de XML a Texto.
-        /// </summary>
-        /// <param name="textoXML"></param>
-        /// <returns></returns>
-        private string XMLToTexto(string textoXML)
-        {
-            return Regex.Replace(
-                textoXML
-                .Replace("\r\n", "")
-                .Replace("\r", "")
-                .Replace("\n", "")
-                .Replace("\t", ""),
-                " {2,}",
-                " ");
-        }
-
-        #endregion
-
-        /// <summary>
-        /// Método para estructura general de XML Token.
-        /// </summary>
-        /// <param name="usuarioId"></param>
-        /// <param name="serialNumber"></param>
-        /// <param name="firstToken"></param>
-        /// <param name="secondToken"></param>
-        /// <returns></returns>
-        private string GenerarXmlTokenAdmin(string usuarioId, string serialNumber, string firstToken, string secondToken)
-        {
-            return $@"<SERVICE>
-                    <TRANSACTION>
-                    <TOKEN_ADMIN>
-                    <CUST_USER_ID>{usuarioId}</CUST_USER_ID>
-                    <SERIAL_NUMBER>{serialNumber}</SERIAL_NUMBER>
-                    <FIRST_TOKEN>{firstToken}</FIRST_TOKEN>
-                    <SECOND_TOKEN>{secondToken}</SECOND_TOKEN>
-                    </TOKEN_ADMIN>
-                    </TRANSACTION>
-                    </SERVICE>";
-        }
-
+        resultado.Fallidos++;
+        await _appLogger.ManejarErrorAsync(ex, $"MT300 no enviado. Folio [{registro.Folio}]", "MT300_ENVIO");
+        continue;                       // after CMT-FR-1 the folio stays eligible; add an attempt cap/quarantine
     }
+    try { await _operacionesTomi.ActualizarMT300ProcesadoAsync(usuarioMQ, registro.Folio, registro.fechaOperacion, ct); }
+    catch (Exception ex) when (!(ex is OperationCanceledException))
+    {
+        await _appLogger.ManejarErrorAsync(ex, $"MT300 ENVIADO pero no marcado. Folio [{registro.Folio}]", "MT300_MARCA");
+        throw;                          // marking is broken: stop instead of sending more
+    }
+    resultado.Enviados++;
 }
-
-
-using AplicacionConector.Enums;
-using AplicacionConector.Interfaces;
-using AplicacionConector.Utilidades;
-using MUFG_T24.Comunes;
-using System;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using System.Xml;
-
-namespace InfraestructuraConector.SOAP
+Benefit: every undelivered or unmarked confirmation raises an alert with its folio and full exception; a stop is not reported as an error; the tick result reflects what happened. Suggested JIRA: CMT-5 (Major)
+CMT-FR-6 - The execution state is finalised only on the happy path, and a failed send or read is reported as success (Major; GEN-7) File: OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):47-72, 161-168; ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs):163.
+Code block (csharp)
+try
 {
-    /// <summary>
-    /// Clase para implementar métodos admistrativos de RSA.
-    /// </summary>
-    public class RSAAdminService : IRSAAdminService
-    {
-        private readonly IRSASoapClient _rsaClient;
-        private readonly IRSAAuthenticationService _authService;
-        private readonly IRSATokenService _tokenService;
-        private readonly IRSAEncrypt _rsaEncript;
-
-        /// <summary>
-        /// Constructor principal
-        /// </summary>
-        /// <param name="rsaClient"></param>
-        /// <param name="authService"></param>
-        /// <param name="tokenService"></param>
-        /// <param name="rsaEncript"></param>
-        public RSAAdminService(IRSASoapClient rsaClient, IRSAAuthenticationService authService, IRSATokenService tokenService, IRSAEncrypt rsaEncript)
-        {
-            _rsaClient = rsaClient;
-            _authService = authService;
-            _tokenService = tokenService;
-            _rsaEncript = rsaEncript;
-        }
-        /// <summary>
-        /// Método para obtener información de Token.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="tokenSn"></param>
-        /// <returns></returns>
-        public async Task<string> InformacionTokenAsync(string clienteOrigen, string tokenSn)
-        {
-
-            var token = await _tokenService.ObtenerInformacionTokenAsync(clienteOrigen, tokenSn);
-
-            if (token == null)
-                return "-1";
-
-            if (token.Estatus != EstatusRegreso.OK)
-                return ((int)token.Estatus).ToString();
-
-            return string.Join("|",
-                "0",
-                $"Activo={(token.Active ? 1 : 0)}",
-                $"Estado={(token.Enabled ? 1 : 0)}",
-                $"PinMode={(token.PinMode ? 1 : 0)}",
-                $"NextTokenCode={(token.NextTokenCode ? 1 : 0)}",
-                $"UsuarioID={token.UserId}",
-                $"UsuarioNombre={token.UserName}",
-                $"UsuarioEnabled={(token.UserEnabled ? 1 : 0)}",
-                $"UsuarioLocked={(token.UserLocked ? 1 : 0)}");
-        }
-        /// <summary>
-        /// Método para habilitar Token 
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="operadorUsuario"></param>
-        /// <param name="operadorTokenSn"></param>
-        /// <param name="operadorTokenCode"></param>
-        /// <param name="tokenSn"></param>
-        /// <returns></returns>
-        public async Task<EstatusRegreso> HabilitaTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode, string tokenSn)
-        {
-            try
-            {
-                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.habilitaToken_WS|Por validar las credenciales del Operador.");
-                if (auth != EstatusRegreso.OK)
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|Falló la validación de las credenciales del Operador.");
-                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
-                }
-                string token = _rsaEncript.Encrypt(tokenSn);
-                string lsEntrada = GenerarXmlTokenAdmin(string.Empty, token, string.Empty, string.Empty);
-
-                string lsRegreso = _rsaClient.EnableToken(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.habilitaToken_WS|Al habilitar token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                string lsTrnResCode = string.Empty;
-                string lsTrnResMsg = string.Empty;
-                string valorMSG = string.Empty;
-                bool respuestaValida = EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG);
-
-                if (!respuestaValida)
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                    {
-                        LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|Token inexistente='{tokenSn}'");
-                        return EstatusRegreso.TokenInexistente;
-                    }
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|Error al habilitar token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.habilitaToken_WS|Token='{tokenSn}' habilitado correctamente.");
-                return EstatusRegreso.OK;
-
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.habilitaToken_WS|{ex}");
-                return EstatusRegreso.ErrorGeneral;
-            }
-        }
-
-        #region AltaUsuarioTokenAsync
-        /// <summary>
-        /// Método para obtener alta de usuario Token.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="operadorUsuario"></param>
-        /// <param name="operadorTokenSn"></param>
-        /// <param name="operadorTokenCode"></param>
-        /// <param name="usuarioId"></param>
-        /// <param name="nombre"></param>
-        /// <param name="apellido"></param>
-        /// <param name="tokenSn"></param>
-        /// <returns></returns>
-        public async Task<EstatusRegreso> AltaUsuarioTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode,
-            string usuarioId, string nombre, string apellido, string tokenSn)
-        {
-            string lsEntrada = string.Empty;
-            string lsRegreso = string.Empty;
-            string lsTrnResCode = string.Empty;
-            string lsTrnResMsg = string.Empty;
-            string valorMSG = string.Empty;
-
-            try
-            {
-                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Por validar las credenciales del Operador.");
-                if (auth != EstatusRegreso.OK)
-                {
-                    LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Falló la validación de las credenciales del Operador.");
-                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
-                }
-                string UsuarioIdEncript = _rsaEncript.Encrypt(usuarioId.ToUpper());
-                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
-                #region Crear Usuario
-                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, string.Empty, nombre, apellido);
-                lsRegreso = _rsaClient.AddUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|A crear el usuario, id='{usuarioId}', nombre='{nombre}', apellido='{apellido}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Error crear el usuario, Codigo='{lsTrnResCode}', Mensaje='{lsTrnResMsg}'");
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Usuario creado correctamente.");
-
-                #endregion
-
-                #region Asociar Token
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenSnEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.LinkTokenToUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|A asociar, id='{usuarioId}' al token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                    {
-                        return EstatusRegreso.TokenInexistente;
-                    }
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Error al asociar token. Codigo='{lsTrnResCode}', Mensaje='{lsTrnResMsg}'");
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Token asociado correctamente.");
-                #endregion
-
-                #region Deshabilitar Token
-
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
-                lsRegreso = _rsaClient.DisableToken(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|A deshabiliar el token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                    {
-                        return EstatusRegreso.TokenInexistente;
-                    }
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Error al deshabilitar token. Codigo='{lsTrnResCode}', Mensaje='{lsTrnResMsg}'");
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Proceso exitoso.");
-                #endregion
-
-                return EstatusRegreso.OK;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|{ex}");
-                return EstatusRegreso.ErrorGeneral;
-            }
-        }
-        #endregion
-
-        #region ReposicionTokenAsync
-        /// <summary>
-        /// Método para obtener reposición Token.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="operadorUsuario"></param>
-        /// <param name="operadorTokenSn"></param>
-        /// <param name="operadorTokenCode"></param>
-        /// <param name="usuarioId"></param>
-        /// <param name="tokenAnterior"></param>
-        /// <param name="tokenNuevo"></param>
-        /// <returns></returns>
-        public async Task<EstatusRegreso> ReposicionTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode,
-            string usuarioId, string tokenAnterior, string tokenNuevo)
-        {
-            string lsEntrada = string.Empty;
-            string lsRegreso = string.Empty;
-            string lsTrnResCode = string.Empty;
-            string lsTrnResMsg = string.Empty;
-            string valorMSG = string.Empty;
-
-            try
-            {
-                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.altaUsuario_token|Por validar las credenciales del Operador.");
-                if (auth != EstatusRegreso.OK)
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.altaUsuario_token|Falló la validación de las credenciales del Operador.");
-                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
-                }
-
-                string UsuarioIdEncript = _rsaEncript.Encrypt(usuarioId);
-                string tokenAnteriorEncript = _rsaEncript.Encrypt(tokenAnterior);
-                string tokenNuevoEncript = _rsaEncript.Encrypt(tokenNuevo);
-                string operadorTokenSnEncript = _rsaEncript.Encrypt(operadorTokenSn);                
-
-                #region Desasociar Token Anterior
-
-                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenAnteriorEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.UnAssignToken(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al desasociar el usuario '{usuarioId}' del token='{tokenAnterior}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al desasociar token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Token anterior desasociado correctamente.");
-
-                #endregion
-
-                #region Deshabilitar Token Anterior
-
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenAnteriorEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.DisableToken(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al deshabilidar el token='{tokenAnterior}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al deshabilitar token anterior. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Token anterior deshabilitado correctamente.");
-
-                #endregion
-
-                #region Asociar nuevo Token
-
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenNuevoEncript, string.Empty, string.Empty);
-                lsRegreso = _rsaClient.LinkTokenToUser(lsEntrada);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al asociar el usuario '{tokenAnterior}' del token='{tokenNuevo}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al asociar nuevo token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Nuevo token asociado correctamente.");
-
-                #endregion
-
-                #region Deshabilitar nuevo token
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenNuevoEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.DisableToken(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al deshabilidar el token='{tokenNuevo}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|Error al deshabilitar nuevo token. Código='{lsTrnResCode}' Mensaje='{lsTrnResMsg}'.");
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Nuevo token deshabilitado correctamente.");
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Proceso exitoso.");
-                #endregion
-
-                return EstatusRegreso.OK;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|{ex}");
-                return EstatusRegreso.ErrorGeneral;
-            }
-        }
-        #endregion
-
-        #region TraspasoTokenAsync
-        /// <summary>
-        /// Método para obtener Transpaso de Token.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="operadorUsuario"></param>
-        /// <param name="operadorTokenSn"></param>
-        /// <param name="operadorTokenCode"></param>
-        /// <param name="usuarioAnterior"></param>
-        /// <param name="usuarioNuevo"></param>
-        /// <param name="nombreNuevo"></param>
-        /// <param name="apellidoNuevo"></param>
-        /// <param name="tokenSn"></param>
-        /// <returns></returns>
-        public async Task<EstatusRegreso> TraspasoTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn,
-            string operadorTokenCode, string usuarioAnterior, string usuarioNuevo, string nombreNuevo, string apellidoNuevo, string tokenSn)
-        {
-            string lsEntrada = string.Empty;
-            string lsRegreso = string.Empty;
-            string lsTrnResCode = string.Empty;
-            string lsTrnResMsg = string.Empty;
-            string valorMSG = string.Empty;
-            try
-            {
-                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Por validar las credenciales del Operador.");
-                if (auth != EstatusRegreso.OK)
-                {
-                    LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.traspaso_token|Falló la validación de las credenciales del Operador.");
-                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
-                }
-                usuarioNuevo = usuarioNuevo.ToLowerInvariant();
-                nombreNuevo = nombreNuevo.ToLowerInvariant();
-                apellidoNuevo = apellidoNuevo.ToLowerInvariant();
-
-                string usuarioNuevoEncript = _rsaEncript.Encrypt(usuarioNuevo);
-                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
-                string usuarioAnteriorEncript = _rsaEncript.Encrypt(usuarioAnterior);
-                
-                #region Crear Usuario nuevo
-                lsEntrada = GenerarXmlTokenAdmin(usuarioNuevoEncript, string.Empty, nombreNuevo.ToLower(), apellidoNuevo.ToUpper());
-
-                lsRegreso = _rsaClient.AddUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Al crear el usuario, id='{usuarioNuevo}', nombre='{nombreNuevo}', apellido='{apellidoNuevo}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Usuario creado correctamente.");
-                #endregion
-
-                #region Desasociar Usuario Anterior
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(usuarioAnteriorEncript, tokenSnEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.UnLinkTokenToUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Al desasociar usuario='{usuarioNuevo}' del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Usuario anterior desasociado correctamente.");
-                #endregion             
-
-                #region Asociar Nuevo Usuario al Token
-
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(usuarioNuevoEncript, tokenSnEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.LinkTokenToUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al asociar usuario='{usuarioAnterior}' del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Nuevo usuario asociado correctamente.");
-
-                #endregion
-
-                #region Eliminar Usuario Anterior
-
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-                lsEntrada = GenerarXmlTokenAdmin(usuarioAnteriorEncript, string.Empty, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.DeleteUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Al dar de baja al usuario='{usuarioAnterior}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Usuario anterior eliminado correctamente.");
-
-                #endregion
-
-                #region Deshabilitar Token
-
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.DisableToken(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.reposicion_token|Al deshabilidar el token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.traspaso_token|Proceso exitoso.");
-
-                #endregion
-
-                return EstatusRegreso.OK;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.reposicion_token|{ex}");
-                return EstatusRegreso.ErrorGeneral;
-            }
-        }
-
-        #endregion
-
-        #region BajaUsuarioTokenAsync
-        /// <summary>
-        /// Método para realizar la Baja de un usuario token.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="operadorUsuario"></param>
-        /// <param name="operadorTokenSn"></param>
-        /// <param name="operadorTokenCode"></param>
-        /// <param name="usuarioId"></param>
-        /// <param name="tokenSn"></param>
-        /// <returns></returns>
-        public async Task<EstatusRegreso> BajaUsuarioTokenAsync(string clienteOrigen, string operadorUsuario, string operadorTokenSn, string operadorTokenCode, string usuarioId, string tokenSn)
-        {
-            string lsEntrada = string.Empty;
-            string lsRegreso = string.Empty;
-            string lsTrnResCode = string.Empty;
-            string lsTrnResMsg = string.Empty;
-            string valorMSG = string.Empty;
-
-            try
-            {
-                var auth = await _authService.AutenticarAsync(clienteOrigen, operadorUsuario, operadorTokenSn, operadorTokenCode);
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Por validar las credenciales del Operador.");
-                if (auth != EstatusRegreso.OK)
-                {
-                    LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Falló la validación de las credenciales del Operador.");
-                    return auth == EstatusRegreso.TokenRequiereSincronizar ? EstatusRegreso.TokenRequiereSincronizar : EstatusRegreso.CredencialesOperadorInvalidas;
-                }
-
-                string UsuarioIdEncript = _rsaEncript.Encrypt(usuarioId);
-                string tokenSnEncript = _rsaEncript.Encrypt(tokenSn);
-
-                #region Desasociar Ususario Token
-
-                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, tokenSnEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.UnLinkTokenToUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Al desasociar usuario='{usuarioId}' del token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                #endregion
-
-                #region Inhabiliatar Token
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(string.Empty, tokenSnEncript, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.DisableToken(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Al inhabilitar token='{tokenSn}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                #endregion
-
-                #region Eliminar Usuario
-                lsTrnResCode = string.Empty;
-                lsTrnResMsg = string.Empty;
-                valorMSG = string.Empty;
-
-                lsEntrada = GenerarXmlTokenAdmin(UsuarioIdEncript, string.Empty, string.Empty, string.Empty);
-
-                lsRegreso = _rsaClient.DeleteUser(lsEntrada);
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|RSA.bajaUsuario_token|Al dar de baja al usuario='{usuarioId}'. Se recibe respuesta del WS=" + XMLToTexto(lsRegreso ?? string.Empty));
-
-                if (!EsValidoAnalisXml(ref lsRegreso, ref lsTrnResCode, ref lsTrnResMsg, ref valorMSG))
-                {
-                    if (lsTrnResCode == ConstantesServicio.TokenInexistenteCode)
-                        return EstatusRegreso.TokenInexistente;
-
-                    return EstatusRegreso.ErrorGeneral;
-                }
-                #endregion
-
-                return EstatusRegreso.OK;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|RSA.bajaUsuario_token|{ex}");
-                return EstatusRegreso.ErrorGeneral;
-            }
-        }
-        #endregion
-
-        #region ValidacionXml
-        /// <summary>
-        /// Método para validación de formato XML.
-        /// </summary>
-        /// <param name="textXML"></param>
-        /// <param name="trnResCode"></param>
-        /// <param name="trnResMsg"></param>
-        /// <param name="valorMSG"></param>
-        /// <returns></returns>
-        private bool EsValidoAnalisXml(ref string textXML, ref string trnResCode, ref string trnResMsg, ref string valorMSG)
-        {
-            XmlElement loXMLElement;
-            XmlElement loXMLSubElement;
-
-            XmlDocument loXMLDoc;
-            string error;
-
-            if (!XmlHelper.TryParseXmlSeguro(textXML, out loXMLDoc, out error))
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                LoggingConector.EscribirLog($"ERROR|RSAAdminService|XML inválido: {error}");
-                return false;
-            }
-
-            loXMLElement = loXMLDoc["SERVICE_RESPONSE"];
-
-            if (loXMLElement == null)
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            loXMLElement = loXMLDoc["TRANSACTION_RESPONSE"];
-
-            if (loXMLElement == null)
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            trnResCode = loXMLElement.Attributes?["trnResCode"]?.Value;
-            trnResMsg = loXMLElement.Attributes?["trnResMsg"]?.Value;
-
-            if (string.IsNullOrWhiteSpace(trnResCode) || string.IsNullOrWhiteSpace(trnResMsg))
-            {
-                trnResCode = "9";
-                trnResMsg = "XML invalido";
-                return false;
-            }
-
-            if (trnResCode == "0" && trnResMsg == "Success")
-            {
-                loXMLElement = loXMLElement["TOKEN_ADMIN_RESPONSE"];
-
-                if (loXMLElement == null)
-                    return false;
-
-                loXMLSubElement = loXMLElement["STATUS"];
-
-                if (loXMLSubElement == null)
-                    return false;
-
-                if (loXMLSubElement.InnerText == "0")
-                {
-                    loXMLSubElement = loXMLElement["MSG"];
-
-                    if (loXMLSubElement != null)
-                    {
-                        valorMSG = loXMLSubElement.InnerText;
-                    }
-                    return true;
-                }
-                return false;
-            }
-            return false;
-        }
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="textoXML"></param>
-        /// <returns></returns>
-        private string XMLToTexto(string textoXML)
-        {
-            return Regex.Replace(
-                textoXML
-                .Replace("\r\n", "")
-                .Replace("\r", "")
-                .Replace("\n", "")
-                .Replace("\t", ""),
-                " {2,}",
-                " ");
-        }
-
-        #endregion
-
-        /// <summary>
-        /// Formato genero para XML Token Admin.
-        /// </summary>
-        /// <param name="usuarioId"></param>
-        /// <param name="serialNumber"></param>
-        /// <param name="firstToken"></param>
-        /// <param name="secondToken"></param>
-        /// <returns></returns>
-        private string GenerarXmlTokenAdmin(string usuarioId, string serialNumber, string firstToken, string secondToken)
-        {
-            return $@"<SERVICE>
-                    <TRANSACTION>
-                    <TOKEN_ADMIN>
-                    <CUST_USER_ID>{usuarioId}</CUST_USER_ID>
-                    <SERIAL_NUMBER>{serialNumber}</SERIAL_NUMBER>
-                    <FIRST_TOKEN>{firstToken}</FIRST_TOKEN>
-                    <SECOND_TOKEN>{secondToken}</SECOND_TOKEN>
-                    </TOKEN_ADMIN>
-                    </TRANSACTION>
-                    </SERVICE>";
-        }
-    }
+    await _controlServicio.ActualizaEJecucion(_configuracion.NombreServicio);     // :49  state = running
+    ...
+    if (resultado.Ejecutar) await RealizaOperaciones(ct);
+    else { _appLogger.Log(TipoLog.WARNING, $"Ejecución detenida: {resultado.Mensaje}"); return false; }   // :59-60  never finalised
+    await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio);   // :63
+    return true;
 }
-
-
-using AplicacionConector.Utilidades;
-using MUFG_T24.Comunes;
-using System;
-using System.Globalization;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-
-namespace Utilidades
+catch (Exception ex) { await _appLogger.ManejarErrorAsync(ex, "Error en ejecución"); return false; }      // :67-70  never finalised
+Issue: ActualizaTerminacion runs only when the tick executes and RealizaOperaciones returns. A non-business day, an out-of-window tick and any exception return early and leave the service row in the "running" state until the next tick or the stop handler. The inverse also holds: RealizaOperaciones swallows its own exceptions (:161-168 and the inner catch of CMT-FR-5), so a failed read, a failed connect or a failed send still reaches :63 and returns true. ServiceHost.TerminacionAsync finalises on stop (:163), so the state is only wrong between ticks.
+Fix: move the finalisation to a finally (guarded so a failure there cannot mask the original one) and return the real outcome from RealizaOperaciones.
+Code block (csharp)
+bool ok = false;
+try { ... ok = await RealizaOperaciones(ct); }
+catch (OperationCanceledException) { throw; }
+catch (Exception ex) { await _appLogger.ManejarErrorAsync(ex, "Error en ejecución"); }
+finally { var fin = await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio); if (!fin.Exito) _appLogger.Log(...); }
+return ok;
+Benefit: the monitored state matches reality; callers and tests can distinguish success from failure. Suggested JIRA: CMT-6 (Major)
+Rewrite Recommended
+CMT-FR-7 - An alert row is inserted on every tick of every non-business day (Major; GEN-10) File: ValidadorEjecucion.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Servicios/ValidadorEjecucion.cs):57-70; OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):57-60; AppLogger.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Comun/AppLogger.cs):59-71.
+Code block (csharp)
+if (!EsDiaHabil)
 {
-    /// <summary>
-    /// Declaración de variables.
-    /// </summary>
-    public class StateObject
-    {
-        public Socket WorkSocket { get; set; }
-        public const int BufferSize = 1024;
-        public byte[] Buffer { get; } = new byte[BufferSize];
-        public StringBuilder ResponseBuilder { get; } = new StringBuilder();
-        public int LargoEsperadoTotal { get; set; } = -1;
-    }
-    /// <summary>
-    /// Clase principal para métodos asincronos.
-    /// </summary>
-    public class AsynchronousClient : IDisposable
-    {
-        private readonly ManualResetEvent _connectDone = new ManualResetEvent(false);
-        private readonly ManualResetEvent _sendDone = new ManualResetEvent(false);
-        private readonly ManualResetEvent _receiveDone = new ManualResetEvent(false);
-
-        private readonly string _clienteOrigen;
-        private readonly string _servidor;
-        private readonly int _puerto;
-        private readonly string _mensaje;
-
-        private string _response = string.Empty;
-        private Socket _client;
-        private bool _disposed;
-        private Exception _lastException;
-
-
-        /// <summary>
-        /// Constructor principal
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="servidor"></param>
-        /// <param name="puerto"></param>
-        /// <param name="mensaje"></param>
-        public AsynchronousClient(string clienteOrigen, string servidor, int puerto, string mensaje)
-        {
-            _clienteOrigen = clienteOrigen;
-            _servidor = servidor;
-            _puerto = puerto;
-            _mensaje = mensaje;           
-        }
-
-        #region Flujo principal
-
-        /// <summary>
-        /// Método para inicializar peticiones Asincronas.
-        /// </summary>
-        private void Inicializar()
-        {
-
-            try
-            {
-                Log($"[{_clienteOrigen}]|HSM|Inicio|Servidor=[ {_servidor}]|Puerto=[{_puerto}]");
-
-                _client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-
-                _connectDone.Reset();
-                _sendDone.Reset();
-                _receiveDone.Reset();
-
-                Log($"[{_clienteOrigen}]|HSM|Conetando|Inicio de conexión|Servidor=[ {_servidor}]|Puerto=[{_puerto}]");
-                _client.BeginConnect(_servidor, _puerto, ConnectCallback, _client);
-
-                if (!_connectDone.WaitOne(TimeSpan.FromSeconds(60)))
-                {
-                    LogError("Timeout durante la conexión al HSM.");
-                    throw new TimeoutException("Timeout durante la conexión al HSM.");
-                }
-                if (_lastException != null)
-                {
-                    throw _lastException;
-                }
-
-                Send(_client, _mensaje);
-
-                if (!_sendDone.WaitOne(TimeSpan.FromSeconds(60)))
-                {
-                    LogError("Timeout durante la conexión al HSM.");
-                    throw new TimeoutException("Timeout durante el envío al HSM.");
-                }
-                if (_lastException != null)
-                {
-                    throw _lastException;
-                }
-
-                Receive(_client);
-                if (!_receiveDone.WaitOne(TimeSpan.FromMinutes(1)))
-                {
-                    LogError("Timeout durante la conexión al HSM.");
-                    throw new TimeoutException("Timeout durante larecepción del HSM.");
-                }
-                if (_lastException != null)
-                {
-                    throw _lastException;
-                }
-            }
-            catch (SocketException ex)
-            {
-                LogError($"[{_clienteOrigen}] SocketException: {ex.Message}| SocketErrorCode: {ex.SocketErrorCode}| ErrorCode:{ex.ErrorCode}|StackTrace: {ex.StackTrace}");
-            }
-            catch (TimeoutException ex)
-            {
-                LogError($"[{_clienteOrigen}] Timeout: {ex.Message}|StackTrace: {ex.StackTrace}");
-            }
-            catch (Exception ex)
-            {
-                LogError($"[{_clienteOrigen}] Error inesperado: {ex}");
-            }
-            finally
-            {
-                try
-                {
-                    if (_client != null)
-                    {
-                        Shutdown();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogError($"Ocurrio un error al cerrar.|Error: {ex.Message}");
-                }
-            }
-        }
-
-        #endregion
-
-        #region Callbacks
-        /// <summary>
-        /// Métod para realizar conexión 
-        /// </summary>
-        /// <param name="ar"></param>
-        private void ConnectCallback(IAsyncResult ar)
-        {
-            try
-            {
-                var client = (Socket)ar.AsyncState;
-                client.EndConnect(ar);
-
-                Log($"[{_clienteOrigen}] Conectado correctamente");
-                _connectDone.Set();
-            }
-            catch (Exception ex)
-            {
-                _lastException = ex;
-                LogError($"ConnectCallback: {ex.Message}");
-                _connectDone.Set();
-            }
-        }
-        /// <summary>
-        /// Método para enviar petición de Socket.
-        /// /// </summary>
-        /// <param name="client"></param>
-        /// <param name="data"></param>
-        private void Send(Socket client, string data)
-        {
-            byte[] byteData = Encoding.ASCII.GetBytes(data);
-            client.BeginSend(byteData, 0, byteData.Length, SocketFlags.None, SendCallback, client);
-        }
-        /// <summary>
-        /// Método para enviar petición de Socket.
-        /// </summary>
-        /// <param name="ar"></param>
-        private void SendCallback(IAsyncResult ar)
-        {
-            try
-            {
-                var client = (Socket)ar.AsyncState;
-                int bytesSent = client.EndSend(ar);
-
-                Log($"[{_clienteOrigen}] Bytes enviados: {bytesSent}");
-                _sendDone.Set();
-            }
-            catch (Exception ex)
-            {
-                _lastException = ex;
-                LogError($"SendCallback: {ex.Message}");
-                _sendDone.Set();
-            }
-        }
-        /// <summary>
-        /// Método para recibir petición de Socket.
-        /// </summary>
-        /// <param name="client"></param>
-        private void Receive(Socket client)
-        {
-            var state = new StateObject { WorkSocket = client };
-
-            client.BeginReceive(state.Buffer, 0, StateObject.BufferSize, SocketFlags.None, ReceiveCallback, state);
-        }
-        /// <summary>
-        /// Recupera información solicitada por medio de Socket.
-        /// </summary>
-        /// <param name="ar"></param>
-        private void ReceiveCallback(IAsyncResult ar)
-        {
-            try
-            {
-                var state = (StateObject)ar.AsyncState;
-                var client = state.WorkSocket;
-
-                int bytesRead = client.EndReceive(ar);
-                Log($"Bytes recibidos: {bytesRead}");
-
-                if (bytesRead > 0)
-                {
-                    string chunk = Encoding.ASCII.GetString(state.Buffer, 0, bytesRead);
-                    Log($"Respuesta Chunk recibida: {chunk}");
-                    state.ResponseBuilder.Append(chunk);
-
-                    if (state.LargoEsperadoTotal < 0 && state.ResponseBuilder.Length >= 6)
-                    {
-                        string largoTexto = state.ResponseBuilder.ToString(0, 6);
-                        if (int.TryParse(largoTexto, NumberStyles.Integer, CultureInfo.InvariantCulture, out int largoBody) && largoBody >= 0)
-                        {
-                            state.LargoEsperadoTotal = 6 + largoBody;
-                        }
-                    }
-
-                    if (state.LargoEsperadoTotal > 0 && state.ResponseBuilder.Length >= state.LargoEsperadoTotal)
-                    {
-                        _response = state.ResponseBuilder.ToString(0, state.LargoEsperadoTotal);
-                        _receiveDone.Set();
-                        Log($"[{_clienteOrigen}] Respuesta recibida: {_response}");
-                        return;
-                    }
-
-                    client.BeginReceive(state.Buffer, 0, StateObject.BufferSize, SocketFlags.None, ReceiveCallback, state);
-                    return;
-                }
-                _response = state.ResponseBuilder.ToString();
-                _receiveDone.Set();
-
-                Log($"[{_clienteOrigen}] Respuesta recibida: {_response}");
-            }
-            catch (Exception ex)
-            {
-                _lastException = ex;
-                LogError($"ReceiveCallback: {ex.Message}");
-                _receiveDone.Set();
-            }
-        }
-
-        #endregion
-
-        #region Público
-        /// <summary>
-        /// Método para obtener respuesta.
-        /// </summary>
-        /// <returns></returns>
-        public string Execute()
-        {
-            Inicializar();
-            return _response;
-        }
-
-        #endregion
-
-        #region Limpieza
-        /// <summary>
-        /// Método para apagar el cliente.
-        /// </summary>
-        private void Shutdown()
-        {
-            try
-            {
-                if (_client != null && _client.Connected)
-                {
-                    _client.Shutdown(SocketShutdown.Both);
-                    _client.Close();
-                }
-            }
-            catch (Exception ex)
-            {
-                LogError($"Error al cerrar socket: {ex.Message}");
-            }
-        }
-        /// <summary>
-        /// Método para liberar recursos.
-        /// </summary>
-        public void Dispose()
-        {
-            if (_disposed) return;
-
-            Shutdown();
-
-            _connectDone.Dispose();
-            _sendDone.Dispose();
-            _receiveDone.Dispose();
-
-            _disposed = true;
-            GC.SuppressFinalize(this);
-        }
-        /// <summary>
-        /// Método para liberar recursos.
-        /// </summary>
-        ~AsynchronousClient()
-        {
-            Dispose();
-        }
-
-        #endregion
-
-        #region Logging
-        /// <summary>
-        /// Lo para registro de Información.
-        /// </summary>
-        /// <param name="mensaje"></param>
-        private static void Log(string mensaje)
-        {
-            LoggingConector.EscribirLog($"[INFO] {mensaje}");
-        }
-        /// <summary>
-        /// Log para registro de errores.
-        /// </summary>
-        /// <param name="mensaje"></param>
-        private static void LogError(string mensaje)
-        {
-            LoggingConector.EscribirLog($"[ERROR] {mensaje}");
-        }
-        #endregion
-    }
+    await _appLogger.LogAsync(TipoLog.WARNING, $"[{nombreServicio}] Día inhábil.", generarAlerta: true, claveAviso: "DIA_INHABIL");
+    return ResultadoValidacionModel.Fallo("Día inhábil");
 }
-
-
-using AplicacionConector.Enums;
-using AplicacionConector.Interfaces;
-using AplicacionConector.Utilidades;
-using MUFG_T24.Comunes;
-using MUFG_T24.Configuracion_utilidades;
-using MUFG_T24.Interfaces_utilidades;
-using System;
-using Utilidades;
-
-namespace InfraestructuraConector.HSM
+Issue: generarAlerta: true makes AppLogger.LogAsync call _alertas.InsertarAlerta on every tick (AppLogger.cs:59-71), so a Saturday or holiday creates one DIA_INHABIL row per tick - 8,640 per day at the 10 s code fallback in ServiceHost.cs:32 (the real interval is in the encrypted configuration, *verify*) - plus one WARNING Ejecución detenida line (OperacionServicio.cs:59) and the shared EsDiaHabil INFO line. The out-of-window branch writes no alert, only the log line. A non-business day is an expected state, not an incident; the alert stream becomes noise that hides real failures such as CMT-FR-5.
+Fix: alert at most once per non-business date (remember the last alerted date in a singleton, or let the alert procedure de-duplicate by service + key + date), and log at INFO/DEBUG on the remaining ticks.
+Code block (csharp)
+if (!esDiaHabil && _ultimaFechaAlertada != hoy) { _ultimaFechaAlertada = hoy; await _appLogger.LogAsync(..., generarAlerta: true, claveAviso: "DIA_INHABIL"); }
+Benefit: one actionable alert per day instead of thousands; lower log and table growth. Suggested JIRA: CMT-7 (Major)
+CMT-FR-8 - State-write results are discarded and the per-tick calls cannot be cancelled (Minor; GEN-9) File: OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):49, 63, 79-80, 117, 144; ValidadorEjecucion.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Servicios/ValidadorEjecucion.cs):59; ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs):107, 160-163.
+Code block (csharp)
+await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio);        // :63  StoredProcedureResult ignored
+await _controlServicio.MarcarPuertoEnUsoAsync(null, null, null, _configuracion.NombreServicio, cleanupCt);   // host :160 ignored
+Issue: the shared ActualizaTerminacion never throws on a SQL failure (it returns Exito = false, RepositorioMaestro.cs:1193-1230), so an unrecorded termination is invisible; MarcarPuertoEnUsoAsync returns a result that the host also drops. ActualizaEJecucion throws on failure and is not affected. Separately, all seven per-tick calls use the overloads without a CancellationToken, so a stop cannot interrupt a slow TOMI call and OnStop waits for it (60 s base timeout) even though the token overloads exist.
+Fix: check Exito and log/alert when false; pass ct to every call listed above (add the parameter to IOperacionesTomi and honour it in the DAO via the token overloads of the shared runner). Benefit: failures of the service-state writes become visible; stop is prompt. Suggested JIRA: CMT-8 (Minor)
+CMT-FR-9 - Configuration values are parsed with silent defaults: the operating window, `MaxRegistros` and three unused required parameters (Minor; GEN-12 variant) File: ValidadorEjecucion.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Servicios/ValidadorEjecucion.cs):83-95; OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):88-91, 110-115; ConstantesServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Enums/ConstantesServicio.cs):9-19.
+Code block (csharp)
+if (!TimeSpan.TryParse(horaInicio, out var horaIni) || !TimeSpan.TryParse(horaFin, out var horaFinParsed)) { ... "Formato de horario inválido" }
+if (horaSistema < horaIni || horaSistema > horaFinParsed) { ... fuera de horario }
+ 
+int maxRegistros = 0;
+if (_configuracion.ParametrosSistema.TryGetValue(ConstantesServicio.MQLimiteRegistros, out string valor))
+    int.TryParse(valor, out maxRegistros);
+Issue (executed probes): (a) TimeSpan.TryParse("8") and ("18") succeed and mean 8 and 18 days (8.00:00:00), so a window configured as 8/18 can never be inside; the service skips every tick with Servicio fuera de horario (8 - 18). (b) "24:00" is rejected, so a window that ends at midnight cannot be expressed; 23:59 stops at 23:59:00. (c) An overnight window (22:00-02:00) is outside at both 23:00 and 01:00 because the test is < ini || > fin. (d) The parse uses the current culture. (e) int.TryParse leaves 0 on a malformed value and accepts negatives, and the SP treats <= 0 as unlimited (@MaxRegistros > 0), so a typo silently removes the limit; the TryGetValue is moot because the key is part of the *required* list (the shared loader throws when it is missing). (f) CALYPSO_MQ_REQ, CALYPSO_MQ_RESP and CALYPSO_MQ_OUT (ConstantesServicio.cs:13-15) are loaded as required but never used (copied from Calypso_Conector), so an environment without those rows fails every tick for no reason.
+Fix: parse once with TimeSpan.TryParseExact(valor, @"hh\:mm", CultureInfo.InvariantCulture, out ...), support overnight windows (ini <= fin ? now >= ini && now <= fin : now >= ini || now <= fin), reject a non-integer or negative limit with a clear error, log the effective limit at start of the tick, and request only the keys this service uses. Benefit: a configuration mistake fails loudly instead of silently disabling the window or the limit. Suggested JIRA: CMT-9 (Minor)
+CMT-FR-10 - The service scaffolding is a near-verbatim copy of the sibling Calypso services (Minor; GEN-4) File: ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs), ValidadorEjecucion.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Servicios/ValidadorEjecucion.cs), ResultadoValidacionModel.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Modelos/ResultadoValidacionModel.cs), AppLogger.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Comun/AppLogger.cs), MapConnectionError.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MapConnectionError.cs).
+Issue (measured, 2.2): 99 of 115 non-trivial lines of ServiceHost.cs (86 %), 58/66 of ValidadorEjecucion.cs (88 %), 63/67 of AppLogger.cs (94 %) and 12/16 of ResultadoValidacionModel.cs (75 %) also appear verbatim in Calypso_Liquidacion; ValidadorEjecucion exists in 3 solutions, AppLogger in 5 and the connection-error mapper in 2. The copy carries its parent's defects with it: CMT-FR-6/7/8/15/17 are the same shapes as CL-FR-7/9/10/18/19, and traces of other services remain (CMT-FR-11).
+Fix: extract the tick skeleton into the shared library (one TickRunner/ServicioBase that does state start -> parameters -> day/window validation with alert-once -> work -> finally state end) and the generic pieces (ResultadoValidacionModel, ValidadorEjecucion, AppLogger, MQ connection mapper) into a versioned package consumed by all services; each service then implements only its own RealizaOperaciones. Fixing CMT-FR-6/7/8/9/17 once in that extraction fixes them in every copy. Benefit: one place to correct and test the shared behaviour instead of five. Suggested JIRA: CMT-10 (Minor)
+Nice to Rewrite if Time Permits
+CMT-FR-11 - Dead members, copy-paste leftovers and naming (Minor) File: several (listed below).
+• OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):4 using Microsoft.Win32; is unused.
+• ResultadoEjecucionModel.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Modelos/ResultadoEjecucionModel.cs):10, 20 GetMtBatch is written and never read (the name suggests a leftover of another service).
+• ConstantesServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Enums/ConstantesServicio.cs):13-15, 22 MQReq, MQResp, MQOut, TipoOperacion are never referenced; the class lives in a namespace called Enums.
+• _configuracion.FechaSistema (OperacionServicio.cs:79) and _configuracion.EsDiaHabil (ValidadorEjecucion.cs:40) are written and never read in this solution; the ObtenerFechaSistemaAsync() round trip is made on every tick only to store a value nobody uses.
+• pendientes is an IEnumerable<> enumerated three times (Any, Count, foreach, :119-137); return an IReadOnlyList<MT300PendienteDTO>.
+• Naming/doc: property fechaTrade (camelCase) in MT300PendienteDTO.cs:12; the local bool EsDiaHabil (ValidadorEjecucion.cs:59) shadows the method name in PascalCase; IAppLogger is documented as "Interfaz de Repositorio" and IValidadorEjecucion as the service "que ejecuta el negocio"; the ResultadoValidacionModel/ResultadoEjecucionModel have public setters and two factory methods each.
+Fix: delete the unused members and imports, rename fechaTrade -> FechaTrade (the SP column is mapped by name, so change the column alias or add a mapping at the same time), correct the XML comments. Benefit: less noise for the next reader. Suggested JIRA: CMT-11 (Minor)
+4.3 Infraestructura_inMT300 (Tier 1)
+MustChange / Rewrite
+CMT-FR-12 - The read ignores `Exito`: a failed procedure looks like "nothing pending" (Major; GEN-11) File: OperacionesTomiDao.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Repositorios/OperacionesTomiDao.cs):30-48; OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):117-123.
+Code block (csharp)
+var resultado = await EjecutarStoredProcedureQuery<MT300PendienteDTO>(ConstantesServicio.uspMT300Pendientes, cmd => { ... }, false);
+return resultado?.Data ?? Enumerable.Empty<MT300PendienteDTO>();          // :42  Exito is never read
+...
+if (!pendientes.Any()) { _appLogger.Log(TipoLog.INFO, "No existen mensajes MT300 pendientes."); return; }
+Issue: the shared EjecutarStoredProcedureQuery converts a SqlException into Exito = false with an empty Data list and does not throw unless validarAfectacion is requested (RepositorioMaestro.cs:385-390, :407, :668-671). The update path checks Exito (OperacionesTomiDao.cs:69-72); the read does not. Any failure of sp_CinMT300_GetOperacionesMT300 - the error 536 described in CMT-FR-2, a deadlock, a timeout, a permission change - is therefore reported as an INFO "no pending messages" and the tick finishes as a success. The most important operational signal of the service (the read is failing) is silent.
+Fix:
+Code block (csharp)
+if (resultado == null || !resultado.Exito)
+    throw new InvalidOperationException($"No fue posible obtener MT300 pendientes: {resultado?.MensajeError}", resultado?.Exception);
+return resultado.Data;
+The exception reaches ManejarErrorAsync in RealizaOperaciones (:165-168) and raises an alert. Benefit: a failing procedure is visible on the first tick instead of looking like an empty queue. Suggested JIRA: CMT-12 (Major)
+CMT-FR-13 - The ActiveMQ connection leaks whenever the connect fails part-way (Major) File: MQServicio.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MQServicio.cs):20, 47-51, 57-77; OperacionServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/OperacionServicio.cs):132-157; ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs):87, 124-128.
+Code block (csharp)
+_connection = factory.CreateConnection(usuario, password);            // :47  field assigned
+_connection.Start();                                                  // :49  broker down / refused -> throws here
+_session = _connection.CreateSession(AcknowledgementMode.AutoAcknowledge);
+...
+catch (NMSConnectionException ex) { ... throw; }                      // :57-77  log and rethrow, nothing is closed
+Code block (csharp)
+await _mQServicio.ConectarAsync(ct);   // :132  outside the try/finally that calls DesconectarAsync
+try { ... } finally { await _mQServicio.DesconectarAsync(); }
+Issue: when Start() (or CreateSession) throws - exactly what happens when the broker is down, refusing connections or rejecting credentials - _connection is already assigned but the exception leaves ConectarAsync without closing it, and the caller's finally is never entered because the call sits *before* the try. MQServicio is registered scoped (ServiceHost.cs:87) but is not IDisposable, so ending the tick scope does nothing. Each failed tick therefore abandons one IConnection with its transport (sockets, reader threads and, if the URI uses failover:, a reconnect thread that keeps retrying) for the life of the process; during a broker outage that is one per tick. *Verify* the URI options in CALYPSO_MQ_SERVIDOR.
+Fix: make MQServicio own its cleanup and move the connect inside the protected region.
+Code block (csharp)
+public class MQServicio : IMQServicio, IDisposable
 {
-    /// <summary>
-    /// Clase para conexión HSM Client
-    /// </summary>
-    public class HsmTcpClient : IHsmClient
+    public Task ConectarAsync(CancellationToken ct)
     {
-        private readonly IHsmConfig _config;
-        private readonly Configuracion _configuracion;
-        /// <summary>
-        /// Constructor
-        /// </summary>
-        /// <param name="config"></param>
-        public HsmTcpClient(IHsmConfig config, IParametrizacion parametrizacion, Configuracion configuracion)
-        {
-            _config = config;
-            _configuracion = configuracion;
-        }
-        /// <summary>
-        /// Método para enviar mensaje.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="mensaje"></param>
-        /// <returns></returns>
-        public string Enviar(string clienteOrigen, string mensaje)
-        {
-            
-            try
-            {
-                string Host = ObtenerValor(ConstantesServicio.HSMSERVIDOR, x => x);
-                int Puerto = Convert.ToInt16(ObtenerValor(ConstantesServicio.HSMPUERTO, y => y));
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|Enviar|Iniciando envio de mensaje, servidor='{Host}', puerto={Puerto}, mensaje='{mensaje}'.");
-
-                string respuesta = string.Empty;               
-
-                using (var envio = new AsynchronousClient(clienteOrigen, Host, Puerto, mensaje))                
-                {
-                    respuesta = envio.Execute();
-                }
-
-                LoggingConector.EscribirLog($"INFO|{clienteOrigen}|Enviar|Mensaje enviado correctamente|Regreso='{respuesta}'.");
-
-                return respuesta;
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog(
-                    $"ERROR|{clienteOrigen}|Enviar|{ex}"
-                );
-
-                return string.Empty;
-            }
-        }
-
-        /// <summary>
-        /// Método para recuperar valor.
-        /// </summary>
-        /// <typeparam name="T"></typeparam>
-        /// <param name="clave"></param>
-        /// <param name="parser"></param>
-        /// <param name="defaultValue"></param>
-        /// <returns></returns>
-        T ObtenerValor<T>(string clave, Func<string, T> parser, T defaultValue = default)
-        {
-            if (_configuracion.ParametrosSistema.TryGetValue(clave, out var valor))
-                return parser(valor);
-
-            LoggingConector.EscribirLog($"INFO|ObtenerValor|Clave no encontrada en BD: {clave}");
-            return defaultValue;
-        }
+        try { ... _connection.Start(); _session = ...; }
+        catch { Cerrar(); throw; }                 // after logging in the existing typed catches
     }
+    public void Dispose() => Cerrar();
+    private void Cerrar() { try { _session?.Dispose(); } catch { } try { _connection?.Dispose(); } catch { } _session = null; _connection = null; }
 }
-
-
-using AplicacionConector.Enums;
-using AplicacionConector.Interfaces;
-using AplicacionConector.Utilidades;
-using MUFG_T24.Comunes;
-using MUFG_T24.Configuracion_utilidades;
-using MUFG_T24.Interfaces_utilidades;
-using System;
-using System.Threading.Tasks;
-
-namespace AplicacionConector
+SimpleInjector disposes scoped IDisposable instances at the end of the tick. Benefit: no leaked connections/threads during broker outages; one place guarantees release. Suggested JIRA: CMT-13 (Major)
+CMT-FR-14 - The complete MT300 text is written to the error log (Major; GEN-5 payload variant) File: MQServicio.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MQServicio.cs):104-108.
+Code block (csharp)
+catch (Exception ex)
 {
-    /// <summary>
-    /// Método principal del servicio
-    /// </summary>
-    public class RequestProcessor : IRequestProcessor
-    {
-        private readonly Func<IRSAService> _rsaServiceFactory;
-        private readonly Func<IHSMService> _hsmServiceFactory;
-        private readonly IControlServicio _controlServicio;
-        private readonly Configuracion _configuracion;
-        private readonly IParametrizacion _parametrizacion;
-
-        /// <summary>
-        /// Constructor principal del servicio
-        /// </summary>
-        /// <param name="rsaServiceFactory"></param>
-        /// <param name="hsmServiceFactory"></param>
-        /// <param name="configuracion"></param>
-        /// <param name="controlServicio"></param>
-        /// <param name="parametrizacion"></param>
-        public RequestProcessor(Func<IRSAService> rsaServiceFactory, Func<IHSMService> hsmServiceFactory, Configuracion configuracion, IControlServicio controlServicio,
-            IParametrizacion parametrizacion)
-        {
-            _rsaServiceFactory = rsaServiceFactory;
-            _hsmServiceFactory = hsmServiceFactory;
-            _configuracion = configuracion;
-            _controlServicio = controlServicio;
-            _parametrizacion = parametrizacion;
-        }
-        /// <summary>
-        /// Método principal para distiguir la opción 
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="solicitud"></param>
-        /// <returns></returns>
-        /// <exception cref="ArgumentNullException"></exception>
-        /// <exception cref="ArgumentException"></exception>
-        public async Task<string> ProcesarPeticionAsync(string clienteOrigen, string solicitud)
-        {
-
-            if (string.IsNullOrWhiteSpace(solicitud))
-                throw new ArgumentNullException(nameof(solicitud));
-
-            if (solicitud.Length < 4)
-                throw new ArgumentException("Solicitud inválida.");
-
-            string tipoSolicitud = solicitud.Substring(0, 3);
-            string payload = solicitud.Substring(4);
-
-
-            try
-            {
-                switch (tipoSolicitud)
-                {
-                    case ConstantesServicio.TIPO_SOLICITUD_RSA:
-                        return await _rsaServiceFactory().ProcesarPeticionAsync(clienteOrigen,payload);
-
-                    case ConstantesServicio.TIPO_SOLICITUD_HSM:
-                        return await _hsmServiceFactory().ProcesarPeticionAsync(clienteOrigen,payload);
-
-                    default:
-                        throw new InvalidOperationException($"Tipo de solicitud no soportada: {tipoSolicitud}");
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"Error|ProcesarPeticionAsync|mensaje: {ex}");
-                throw;
-            }
-            finally
-            {
-                await TerminaContextoAsync();
-            }
-            
-        }
-
-        /// <summary>
-        /// Método para marcar la terminación del servicio.
-        /// </summary>
-        /// <returns></returns>
-        private async Task TerminaContextoAsync()
-        {
-            await _controlServicio.ActualizaTerminacion(_configuracion.NombreServicio);
-        }
-
-    }
+    _appLogger.Log(TipoLog.ERROR, $"Error al enviar mensaje a servidor MQ. | Folio:{pendienteDto.Folio} | Mensaje={pendienteDto.Mensaje} | {ex.Message}");
+    return Task.FromException(ex);
 }
-
-
-using AplicacionConector.Enums;
-using AplicacionConector.Interfaces;
-using AplicacionConector.Utilidades;
-using MUFG_T24.Comunes;
-using MUFG_T24.Configuracion_utilidades;
-using System;
-using System.Globalization;
-using System.Linq;
-using System.Threading.Tasks;
-
-namespace AplicacionConector
-{
-    /// <summary>
-    /// Clase principal para el servicio HSM.
-    /// </summary>
-    public class HSMService : IHSMService
-    {
-        private const string Prefijo = ConstantesServicio.Prefijo;
-        private const string CodigoOk = ConstantesServicio.CodigoOk;
-
-        private readonly Configuracion _configuracion;
-        private readonly IHsmClient _hsmClient;
-        private readonly IHsmConfig _hsmConfig;
-        private IHsmConfig _hcConfig;
-
-        public HSMService(Configuracion configuracion, IHsmClient hsmClient, IHsmConfig hsmConfig)
-        {
-            _configuracion = configuracion;
-            _hsmClient = hsmClient;
-            _hsmConfig = hsmConfig;
-        }
-        /// <summary>
-        /// Método para procesar petición HSM.
-        /// </summary>
-        /// <param name="clienteOrigen"></param>
-        /// <param name="solicitud"></param>
-        /// <returns></returns>
-        public async Task<string> ProcesarPeticionAsync(string clienteOrigen, string solicitud)
-        {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(solicitud))
-                    throw new Exception("Solicitud vacía.");
-
-                var parametros = solicitud.Split('|').Select(p => p?.Trim()).ToArray();
-
-                if (parametros.Length == 0)
-                    throw new Exception("Formato inválido.");
-
-                ValidarCantidadParametros(parametros, 1);
-                switch (parametros[0].ToLower())
-                {
-                    case ConstantesServicio.VALIDA:
-
-                        ValidarCantidadParametros(parametros, 3);
-                        if (_hsmConfig.Eco)
-                        {
-                            LogInfo("Modo ECO habilitado.", clienteOrigen);
-                            return ConstantesServicio.Cero;
-                        }
-
-                        return ValidaPase(clienteOrigen, parametros[1], parametros[2]);
-
-                    case ConstantesServicio.GENERA:
-                        ValidarCantidadParametros(parametros, 2);
-                        return GeneraClave(clienteOrigen, parametros[1]);
-
-                    default:
-                        LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|HSM|Operacion no soportada:{parametros[0]}");
-                        return ConstantesServicio.Nueve;
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{clienteOrigen}|HSM|ProcesarPeticion|{ex}");
-                return ConstantesServicio.Nueve;
-            }
-        }
-
-        #region Operaciones HSM
-        /// <summary>
-        /// Método para validar pase Validar Pase
-        /// </summary>
-        /// <param name="origen"></param>
-        /// <param name="hash"></param>
-        /// <param name="clave"></param>
-        /// <returns></returns>
-        private string ValidaPase(string origen, string hash, string clave)
-        {
-            if (string.IsNullOrEmpty(origen))
-                throw new ArgumentNullException("Origen requerido.", nameof(origen));
-
-            if (string.IsNullOrEmpty(hash))
-                throw new ArgumentNullException("Hash requerido.", nameof(hash));
-
-            if (string.IsNullOrEmpty(clave))
-                throw new ArgumentNullException("Clave requerido.", nameof(clave));
-
-            const string comando = ConstantesServicio.comando0905;
-
-            string peticion = comando + GeneraLMK17() + ConstantesServicio.H + hash.Length.ToString().PadLeft(4, '0') +
-                hash + ConstantesServicio.CeroUno + clave.Length.ToString().PadLeft(4, '0') + clave;
-
-
-            LogInfo($"ValidaPase request:{peticion}", origen);
-
-            string response = _hsmClient.Enviar(origen, ConstruirMensaje(peticion));
-
-            if (string.IsNullOrEmpty(response))
-                throw new ArgumentNullException("El HSM no devolvio una respuesta valida");
-
-            string data = InterpretarRespuesta(response, comando);
-
-            LoggingConector.EscribirLog($"data:{data}");
-
-            return data == ConstantesServicio.Uno ? ConstantesServicio.Cero : ConstantesServicio.Uno;
-        }
-
-        private string GeneraClave(string origen, string hash)
-        {
-            LoggingConector.EscribirLog($"INFO|HSM|GeneraClave|origen:{origen}|hash: {hash}");
-            if (string.IsNullOrEmpty(origen))
-            {
-                LoggingConector.EscribirLog($"ERROR|HSM|El origen es vacio o nulo.");
-                throw new ArgumentNullException("El origen es requerido.", nameof(origen));
-            }
-
-            if (string.IsNullOrEmpty(hash))
-            {
-                LoggingConector.EscribirLog($"ERROR|HSM|Hash es vacio o nulo.");
-                throw new ArgumentNullException("El Hash es requerido.", nameof(hash));
-            }
-
-            const string comando = ConstantesServicio.comando0904;
-
-            string peticion = comando + GeneraLMK17() + ConstantesServicio.H + hash.Length.ToString().PadLeft(4, '0') + hash;
-            LoggingConector.EscribirLog($"INFO|{origen}|HSM|GeneraClave|Enviando petición|Peticion=[{peticion}]");
-
-            string response;
-            try
-            {
-                response = _hsmClient.Enviar(origen, ConstruirMensaje(peticion));
-            }
-            catch (Exception ex)
-            {
-                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Error al enviar petición al HSM|Error=[{ex.Message}]");
-                return string.Empty;
-            }
-            
-            LoggingConector.EscribirLog($"INFO|{origen}|HSM|GeneraClave|Respuesta recibida={response}");
-
-            if (string.IsNullOrWhiteSpace(response))
-            {
-                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Respuesta vacía del HSM|Comando=[{comando}]");
-                return string.Empty;
-            }
-
-            string data = InterpretarRespuesta(response, comando);
-
-            LoggingConector.EscribirLog($"INFO|{origen}|HSM|GeneraClave|Resultado InterpretarRespuesta|DataLength={(data == null ? 0 : data.Length)}");
-
-            if (string.IsNullOrEmpty(data))
-            {
-                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|InterpretarRespuesta devolvio vacío|Response.Lenght=[{response.Length}]|Comando=[{comando}]");
-                return string.Empty;
-            }
-
-            if (data.Length < 4)
-            {
-                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Respuesta menor a 4 caracteres|Formato de respuesta inválido.|DataLength=[{data.Length}]");
-                return string.Empty;
-            }
-
-            if (!int.TryParse(data.Substring(0, 4), out int largo))
-            {
-                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Formato de respuesta inválido|Longitud de clave no numerica|Largo recibido=[{largo}]|DataLength=[{data.Length}]");
-                return string.Empty;
-            }
-
-            string clave = data.Substring(4);
-
-            if (largo != clave.Length)
-            {
-                LoggingConector.EscribirLog($"ERROR|{origen}|HSM|GeneraClave|Longitud inválida.");
-                return string.Empty;
-            }
-
-            LogInfo($"Clave generada correctamente:{clave}", origen);
-            return ConstantesServicio.Cero + clave;
-        }
-
-        #endregion
-
-        #region Construcción Mensajes
-        /// <summary>
-        /// Método para genera clave LMK17
-        /// </summary>
-        /// <returns></returns>
-        /// <exception cref="InvalidOperationException"></exception>
-        private string GeneraLMK17()
-        {
-            if (_hcConfig == null)
-            {
-                _hcConfig = ObtenerConfiguracionHsm();
-            }
-
-            if (string.IsNullOrWhiteSpace(_hcConfig.LMK17))
-                throw new InvalidOperationException("LMK17 no configurado.");
-
-            if (string.IsNullOrWhiteSpace(_hcConfig.LMK17Check))
-                throw new InvalidOperationException("LMK17Check no configurado.");
-
-            return ConstantesServicio.D + _hcConfig.LMK17.Length.ToString().PadLeft(4, '0') + _hcConfig.LMK17 +
-                ConstantesServicio.L17 + _hcConfig.LMK17Check.Length.ToString().PadLeft(2, '0') + _hcConfig.LMK17Check;
-        }
-        /// <summary>
-        /// Método para armar mensaje completo de servicio HSM.
-        /// </summary>
-        /// <param name="body"></param>
-        /// <returns></returns>
-        private string ConstruirMensaje(string body)
-        {
-            string mensajeCompleto = Prefijo + body;
-            LoggingConector.EscribirLog(mensajeCompleto.Length.ToString().PadLeft(6, '0') + mensajeCompleto);
-            return mensajeCompleto.Length.ToString().PadLeft(6, '0') + mensajeCompleto;
-
-
-        }
-
-        /// <summary>
-        /// Método para interpretar respuesta de servicio HSM.
-        /// </summary>
-        /// <param name="respuesta"></param>
-        /// <param name="comando"></param>
-        /// <returns></returns>
-        private string InterpretarRespuesta(string respuesta, string comando)
-        {
-            if (string.IsNullOrWhiteSpace(respuesta))
-                return string.Empty;
-
-            LoggingConector.EscribirLog($"respuesta:[{respuesta}]|respuesta.Lenght={respuesta.Length}|comando:{comando}");
-
-            int largo = ParseEnteroRequerido(respuesta.Substring(0, 6), "LargoRespuestaHSM");
-
-            string body = respuesta.Substring(6);
-
-            LoggingConector.EscribirLog($"largo declarado:[{largo.ToString()}]|body:[{body}]|body.Lenght=[{body.Length}]");
-
-            if (largo != body.Length)
-            {
-                LoggingConector.EscribirLog($"ERROR|HSM|InterpretarRespuesta|Longitud inválida.|Esperado={largo}|Real={body.Length}");
-                return string.Empty;
-            }
-
-            string encabezado = Prefijo + comando + CodigoOk;
-
-            LoggingConector.EscribirLog($"Prefijo=[{Prefijo}]|Prefijo.Length=[{Prefijo.Length}]|comando=[{comando}]|comando.Lenght=[{comando.Length}]|CodigoOK=[{ConstantesServicio.CodigoOk}]|CodigoOK.Lenght=[{ConstantesServicio.CodigoOk.Length}]");
-            bool coincide = body.StartsWith(encabezado);
-            LoggingConector.EscribirLog($"Prefijo=[{Prefijo}]|body.Lenght=[{body.Length}]|encabezado=[{encabezado}]|encabezado.Lenght=[{encabezado.Length}]|StartsWith=[{coincide}]");
-
-            if (!coincide)
-            {
-                LoggingConector.EscribirLog($"ERROR|HSM|InterpretarRespuesta|Código de respuesta inválido.");
-
-                return string.Empty;
-            }
-
-            string resultado = body.Substring(encabezado.Length);
-
-            LoggingConector.EscribirLog($"Resultado=[{resultado}]|resultado.Length=[{resultado.Length}]");
-            return resultado;
-        }
-
-        #endregion
-
-        #region Logging
-        /// <summary>
-        /// Método para imprimir Log Informativo de HSM.
-        /// </summary>
-        /// <param name="mensaje"></param>
-        /// <param name="clienteOrigen"></param>
-        private void LogInfo(string mensaje, string clienteOrigen)
-        {
-            LoggingConector.EscribirLog($"INFO|{clienteOrigen}|HSM|{mensaje}");
-        }
-        #endregion
-
-        /// <summary>
-        /// Método para obtener valor de parametros de configuracion de MQ.
-        /// </summary>
-        /// <typeparam name="T"></typeparam>
-        /// <param name="clave"></param>
-        /// <param name="parser"></param>
-        /// <param name="defaultValue"></param>
-        /// <returns></returns>
-        T ObtenerValor<T>(string clave, Func<string, T> parser, T defaultValue = default)
-        {
-            if (_configuracion.ParametrosSistema.TryGetValue(clave, out var valor))
-                return parser(valor);
-
-            LoggingConector.EscribirLog($"INFO|ObtenerValor|Clave no encontrada en BD: {clave}");
-            return defaultValue;
-        }
-
-        /// <summary>
-        /// Método para obtener configuracion HSM.
-        /// </summary>
-        /// <returns></returns>
-        public HsmConfig ObtenerConfiguracionHsm()
-        {
-            return new HsmConfig
-            {
-                Host = ObtenerValor(ConstantesServicio.HSMSERVIDOR, x => x),
-                Puerto = ParseEnteroRequerido(ObtenerValor(ConstantesServicio.HSMPUERTO, x => x), ConstantesServicio.HSMPUERTO),
-                LMK17 = ObtenerValor(ConstantesServicio.HSMLMK17, x => x),
-                LMK17Check = ObtenerValor(ConstantesServicio.HSMCSLMK17, x => x),
-                Eco = ParseBooleanoRequerido(ObtenerValor(ConstantesServicio.RSA_ECO, x => x), ConstantesServicio.RSA_ECO)
-            };
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="valor"></param>
-        /// <param name="nombreCampo"></param>
-        /// <returns></returns>
-        /// <exception cref="Exception"></exception>
-        public static int ParseEnteroRequerido(string valor, string nombreCampo)
-        {
-            if (string.IsNullOrWhiteSpace(valor))
-            {
-                throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' porque viene vacío.");
-            }
-
-            if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result))
-            {
-                return result;
-            }
-
-            throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' con valor '" + valor + "' a Int32.");
-        }
-
-        /// <summary>
-        /// Método pra validar cantidad de parametros
-        /// </summary>
-        /// <param name="parametros"></param>
-        /// <param name="cantidadEsperada"></param>
-        /// <exception cref="ArgumentException"></exception>
-        private static void ValidarCantidadParametros(string[] parametros, int cantidadEsperada)
-        {
-            if (parametros.Length < cantidadEsperada)
-            {
-                throw new ArgumentException(
-                    "Cantidad de parámetros inválida.");
-            }
-        }
-        public static bool ParseBooleanoRequerido(string valor, string nombreCampo)
-        {
-            if (string.IsNullOrWhiteSpace(valor))
-            {
-                throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' porque viene vacío.");
-            }
-
-            if (bool.TryParse(valor, out var result))
-            {
-                return result;
-            }
-
-            if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result2) && (result2 == 0 || result2 == 1))
-            {
-                return result2 == 1;
-            }
-
-            throw new Exception("No fue posible convertir el campo '" + nombreCampo + "' con valor '" + valor + "' a Boolean.");
-        }
-    }
-}
-
-
+Issue: Mensaje is the full SWIFT MT300 foreign-exchange confirmation (parties, amounts, value dates, settlement instructions). code_review.md section 5 requires that logs never contain full sensitive payloads (Blocker) and section 9 asks for financial data to be masked in logs; the content is already stored in TOMI by design, so the log copy adds exposure and no diagnostic value beyond the folio. The same failure is logged a second time by the caller without the payload (OperacionServicio.cs:150, CMT-FR-5). Priority is Major rather than Blocker because the line is written only on the failure path; the actual field content was not observed (*verify* with a sample NF_MQ_MSG).
+Fix: log the folio, queue, message length and the exception (with stack), never the body; keep a single log point (the caller).
+Code block (csharp)
+_appLogger.Log(TipoLog.ERROR, $"Envío a MQ fallido | Folio:{pendienteDto.Folio} | Longitud:{pendienteDto.Mensaje?.Length} | {ex}");
+Benefit: removes counterparty and amount data from log files and any log-aggregation tooling. Suggested JIRA: CMT-14 (Major)
+CMT-FR-15 - The alert adapter dereferences a nullable PID unguarded (Minor; GEN-8, latent) File: AppLogger.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Comun/AppLogger.cs):61-69; ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs):107.
+Code block (csharp)
+PId = _configuracion.Pid.Value,        // AppLogger.cs:66  Pid is int?
+Issue: Configuracion.Pid is nullable and .Value throws InvalidOperationException when it is null. The start-up use (ServiceHost.cs:107) is safe because the shared base validates the PID before the timer starts; the alert path is used by every ManejarErrorAsync and is safe only because the per-tick Configuracion is cloned after start-up. If it ever were null, the exception would replace the original error inside the error handler, and no alert would be written.
+Fix: PId = _configuracion.Pid.GetValueOrDefault() (the convention already used by Calypso_Forex, whose host has no .Pid.Value). Benefit: the error path cannot fail because of the metadata it adds. Suggested JIRA: CMT-15 (Minor)
+Rewrite Recommended
+CMT-FR-16 - MQ client: producer per message, non-exception-safe disconnect, no timeouts, no message identity (Minor; GEN-18 outbound variant) File: MQServicio.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MQServicio.cs):25-55, 80-125.
+Code block (csharp)
+var destination = _session.GetQueue(cola);
+var producer = _session.CreateProducer(destination);                  // :92-94  per message, never closed
+producer.DeliveryMode = MsgDeliveryMode.Persistent;
+producer.Send(_session.CreateTextMessage(pendienteDto.Mensaje));      // :98  no id, no correlation, no type
+...
+_session?.Close();  _connection?.Close();                             // :116-117  a throwing Close skips the next line
+Issue: (1) a new IMessageProducer is created for every message and never closed, so a batch of N registers N producers until the session ends. (2) DesconectarAsync calls Close then Dispose on each object in sequence; if _session.Close() throws, _connection is never closed and the exception from the caller's finally hides the original error. (3) ConectarAsync/EnviarMensajeAsync/DesconectarAsync return completed or faulted tasks but block the thread (Start() and Send() are synchronous); no timeout is set in code, and ct is only checked before each step, so a broker that accepts the TCP connection and stalls holds the tick until OnStop gives up after 60 s (the URI options may add timeouts or infinite failover retries - *verify*). (4) The message carries no NMSCorrelationID, type or folio property, so the Calypso consumer cannot de-duplicate and an operator cannot find a message in the broker console. (5) AcknowledgementMode.AutoAcknowledge (:51), the GEN-18 lead, is meaningless here: the session only produces, so there is no inbound acknowledge-before-persist risk; the real outbound defect is on the database side (CMT-FR-1, CMT-FR-3). With a non-transacted session and persistent mode Send returns after the broker accepts the message unless the URI enables async send (*verify*).
+Fix: create the producer once per connection, set message.NMSCorrelationID = folio and a Folio property, close each resource in its own try/catch, put timeouts in the URI (transport.timeout, connection.requestTimeout, bounded failover retries), and name the methods honestly (synchronous) or use a real async API. Benefit: fewer broker resources, traceable and de-duplicable messages, no hang on a stalled broker. Suggested JIRA: CMT-16 (Minor)
+CMT-FR-17 - `[CallerMemberName]` is declared only on the implementation, so every log line has an empty method name (Minor) File: IAppLogger.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Interfaces/IAppLogger.cs):12-26; AppLogger.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Comun/AppLogger.cs):31-34, 44-51, 77-82.
+Code block (csharp)
+void Log(TipoLog tipo, string mensaje, string metodo = "");                              // interface: no attribute
+public void Log(TipoLog tipo, string mensaje, [CallerMemberName] string metodo = "")     // implementation: attribute
+Issue (executed probe): the compiler fills caller-info arguments from the declaration it binds to. Every call in the solution goes through IAppLogger, whose parameters carry no attribute, so metodo is "" and each line is written as INFO||Conexión MQ establecida.; calling the same method through the concrete type printed [ViaClass], through the interface []. The {tipo}|{metodo}|{mensaje} format (AppLogger.cs:37, 53) therefore never carries the method, which is the field operations would grep on.
+Fix: add [CallerMemberName] to the interface parameters (and using System.Runtime.CompilerServices to the Aplicacion project); the implementation can keep or drop it. Benefit: log lines identify the calling method again. Suggested JIRA: CMT-17 (Minor)
+Nice to Rewrite if Time Permits
+CMT-FR-18 - Small robustness and clean-up items in the infrastructure layer (Minor) File: MapConnectionError.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MapConnectionError.cs):6-37; MQServicio.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/MQ/MQServicio.cs):18-23, 27-30; OperacionesTomiDao.cs (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Repositorios/OperacionesTomiDao.cs):19-26.
+• message.ToLower() (:15) is culture-sensitive (in tr-TR "TIMED OUT" does not lower-case to "timed out") and throws on a null message; use message?.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0. The class has one static method but is an instantiable public class; make it static.
+• MQServicio._configuracion is used (parameters), but OperacionesTomiDao._configuracion (:19, :26) is assigned and never read; remove it and the constructor argument.
+• EnviarMensajeAsync swallows into Task.FromException(ex) while ConectarAsync uses throw;; use one style (throw; inside the catch).
+• XML comments describe something else: ConectarAsync says "Realiza la prueba de conexión" (it opens the connection kept for the batch); AppLogger is "Clase de acceso a datos para el guardado de Logs".
+• The connection-error mapper is also copied in FCMConector; move it to the shared library with CMT-FR-10.
+Fix: apply the items above; no behaviour change. Benefit: fewer surprises under unusual cultures and malformed errors. Suggested JIRA: CMT-18 (Minor)
+4.4 Calypso_inMT300 - Windows Service host (Tier 2)
+MustChange / Rewrite
+CMT-FR-19 - The solution builds only on a machine that has `D:\ServiceCMS` (nine absolute references, four projects) (Blocker; GEN-1) File: Aplicacion_inMT300.csproj (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Aplicacion_inMT300.csproj):54; Infraestructura_inMT300.csproj (../../CALYPSO/Calypso_inMT300/Infraestructura_inMT300/Infraestructura_inMT300.csproj):53, 56, 62; Calypso_inMT300.csproj (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/Calypso_inMT300.csproj):61, 65, 72, 76; PruebasUnitarias.csproj (../../CALYPSO/Calypso_inMT300/PruebasUnitarias/PruebasUnitarias.csproj):22.
+Code block (xml)
+<Reference Include="MUFG_T24, Version=1.0.0.0, Culture=neutral, processorArchitecture=x86">
+  <SpecificVersion>False</SpecificVersion>
+  <HintPath>D:\ServiceCMS\MUFG_T24.dll</HintPath>
+</Reference>
+<!-- also D:\ServiceCMS\Apache.NMS.dll, Apache.NMS.ActiveMQ.dll, SimpleInjector.dll -->
+Issue: MUFG_T24, Apache.NMS, Apache.NMS.ActiveMQ and SimpleInjector are taken from a drive-mapped folder with SpecificVersion=False, so the version compiled is whatever sits in that folder on that machine. packages.config in the Infraestructura and host projects restores Apache.NMS and Apache.NMS.ActiveMQ 2.2.0 (and SharpZipLib 1.3.3, which *is* referenced from ..\packages), but the NMS HintPaths point at D:\ServiceCMS, so the restored packages are not what is compiled; SimpleInjector is not restored at all. D:\ServiceCMS does not exist on the audit machine, no nuget.config exists, and the solution maps Debug|Any CPU to the x86 platform while MUFG_T24 is declared x86 (GEN-1). The empty PruebasUnitarias\bin\ and the restore-only obj\ are consistent with a build that could not finish.
+Fix: publish MUFG_T24 as a versioned internal package and reference NMS and SimpleInjector through PackageReference with pinned versions; build in CI on a clean agent; remove the unused packages.config entries or make them the only source. Benefit: reproducible builds and a known runtime version; a prerequisite for CI and for the test project (CMT-FR-22). Suggested JIRA: CMT-19 (Blocker)
+Rewrite Recommended
+CMT-FR-20 - Composition-root clean-ups and an implicit dependency for masking the MQ password (Minor) File: ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs):52-55, 80-91, 139-176; ConstantesServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Enums/ConstantesServicio.cs):9.
+• The comment at :80 says "Transient + Factory (lazy)" but the registration is Lifestyle.Scoped; the other collaborators are transient while depending on scoped Configuracion/IAppLogger. This works because every resolution happens inside a tick scope, except IParametrizacion/IControlServicio at :102-106, which depend only on the singleton IAlertas (checked in the shared constructors, so that is safe).
+• _containerDI and the Alertas singleton are never disposed in TerminacionAsync.
+• ObtenerParametrosSistemaAsync(ConstantesServicio.ParametrosSistema) declares all ten keys non-sensitive, so the shared loader logs Parámetro 'CALYPSO_MQ_PSW' = '...' through the normal path; the value is masked only because FileLogger.cs:59 has the key in a hard-coded list in another assembly. FCMConector requests its password through the sensitive overload (FCMConector\...\OperacionServicio.cs:111).
+Fix: correct the comment, dispose the container on stop, and request CALYPSO_MQ_PSW (and the user) as sensitive parameters so the masking does not depend on a list elsewhere. Benefit: the password stays out of logs even if the shared list changes. Suggested JIRA: CMT-20 (Minor)
+Nice to Rewrite if Time Permits
+CMT-FR-21 - Legacy logging facades, dead flag and repository hygiene (Minor) File: ServiceHost.cs (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/ServiceHost.cs):70, 76-77, 88, 111, 132, 141-175; App.config (../../CALYPSO/Calypso_inMT300/Calypso_inMT300/App.config).
+• Three logging routes coexist: Logging.Write/Logging.Init (:76-77), Config.EscribirLog (:111, 132, 141-174) and IAppLogger (the rest of the solution). Prefer one injected logger in the host as well.
+• ForzaEjecucionServicios is copied into the configuration (:70) but nothing reads it here or in the shared library (the override is the DB general setting FORZA_EJECUCION_SERVICIOS inside EsDiaHabil), so the flag suggests a control that does not exist.
+• :88 keeps a commented registration of IRecuperacionDatos<SwiftMessagesDTO>/MensajesSwiftDao, a leftover of a Swift service.
+• App.config contains only supportedRuntime; AutoGenerateBindingRedirects is on. The repository has no README, build/deploy description or CI file; the three AssemblyInfo.cs files carry empty company/description and a fixed 1.0.0.0.
+Fix: delete the dead lines, document installation and the required CALYPSO_* parameters in a README, version the assemblies from the build. Benefit: the next maintainer can build, install and diagnose the service without tribal knowledge. Suggested JIRA: CMT-21 (Minor)
+4.5 PruebasUnitarias (Tier 2)
+MustChange / Rewrite
+CMT-FR-22 - The test project cannot compile, so none of the three tests can run (Major) File: OperacionServicioUT.cs (../../CALYPSO/Calypso_inMT300/PruebasUnitarias/OperacionServicioUT.cs):60, 64-65, 161, 165-166, 209-213, 230, 234-235; General\MUFGT24_BTMUM_64\...\IParametrizacion.cs:17, 24; IMQServicio.cs (../../CALYPSO/Calypso_inMT300/Aplicacion_inMT300/Interfaces/IMQServicio.cs):14.
+Code block (csharp)
+_parametrizacionMock.Setup(x => x.ObtenerFechaSistemaAsync())                       // :60, :161, :230
+_parametrizacionMock.Setup(x => x.ObtenerParametrosSistemaAsync(It.IsAny<string>())) // :64, :165, :234
+_mqMock.Verify(x => x.EnviarMensajeAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(3));   // :209-213
+Code block (csharp)
+Task<string> ObtenerFechaSistemaAsync(CancellationToken ct = default);                                   // IParametrizacion.cs:17
+Task EnviarMensajeAsync(string cola, MT300PendienteDTO pendienteDto, CancellationToken ct);              // IMQServicio.cs:14
+Issue: two different compile errors, six and one occurrences. (a) The first two lines call methods with an optional CancellationToken inside an expression tree (CS0854, "an expression tree may not contain a call or invocation that uses optional arguments"); this occurs three times each. (b) The Verify passes It.IsAny<string>() for the second argument, which is an MT300PendienteDTO (CS1503, no conversion from string). A stand-in compile with the same signatures reproduces both diagnostics (CS0854 for the optional-argument calls and CS1503 for the string argument; section 2). Any one of them stops the whole assembly from compiling, so the suite cannot run, and the empty PruebasUnitarias\bin\ is consistent with that. The IDE/CI never exercised this project.
+Fix:
+Code block (csharp)
+_parametrizacionMock.Setup(x => x.ObtenerFechaSistemaAsync(It.IsAny<CancellationToken>())).ReturnsAsync("20260706");
+_parametrizacionMock.Setup(x => x.ObtenerParametrosSistemaAsync(It.IsAny<string>(), It.IsAny<CancellationToken>())).ReturnsAsync(parametros);
+_mqMock.Verify(x => x.EnviarMensajeAsync(It.IsAny<string>(), It.IsAny<MT300PendienteDTO>(), It.IsAny<CancellationToken>()), Times.Exactly(3));
+Add a pipeline step that runs dotnet test/vstest on every commit once CMT-FR-19 makes the solution buildable. Benefit: the suite compiles and becomes a gate. Suggested JIRA: CMT-22 (Major)
+CMT-FR-23 - Even once compiled, the suite proves almost nothing about the logic that can lose messages (Major) File: OperacionServicioUT.cs (../../CALYPSO/Calypso_inMT300/PruebasUnitarias/OperacionServicioUT.cs):56-86, 88-131, 133-225.
+Issue: (1) EjecutarProcedimientosAsync_SinPendientes_NoProcesaMensajes (:56-86) sets up ObtenerParametrosSistemaAsync without `Returns`; Moq then returns a completed task with a null dictionary (the default for a concrete Dictionary<,>), parametros[HoraInicioMQ] (OperacionServicio.cs:90) throws a NullReferenceException, ManejarErrorAsync (a mock) swallows it and the method returns false. ConectarAsync is "never called" because the tick failed, not because nothing was pending; the empty-list set-up is never reached and the returned value is not asserted. (2) The other two tests exercise only the happy path (one and three messages); only the third asserts the result. (3) Nothing covers a send failure, a mark failure, a connect failure, cancellation, an invalid or missing parameter, an invalid validator result, the Exito=false path of the DAO, the order "send before mark", ValidadorEjecucion (day/window, CMT-FR-9), MQServicio, OperacionesTomiDao, MapConnectionError or the host. (4) The two procedures that decide whether a message is lost (CMT-FR-1 to 3) have no test at all. None of the defects in this report would be caught by the current tests.
+Fix: fix test 1 to return a full parameter set and assert Times.Never plus Assert.IsTrue; add tests for: send throws (alert raised with the folio, result false, remaining folios behaviour), mark throws after send, connect throws (connection released), cancellation mid-batch, validator invalid (no connect, ActualizaTerminacion still called once CMT-FR-6 is fixed), MaxRegistros parsing, window parsing ("8", "23:59", overnight), DAO Exito=false; add tSQLt (or an integration script) cases for both procedures: malformed message, @MaxRegistros smaller than the candidate count, date mismatch, retry after a failed send. Benefit: regression protection for the failure modes that matter. Suggested JIRA: CMT-23 (Major)
+Rewrite Recommended
+CMT-FR-24 - Test hygiene (Minor) File: OperacionServicioUT.cs (../../CALYPSO/Calypso_inMT300/PruebasUnitarias/OperacionServicioUT.cs):64-77, 165-178, 227-259, 12-13; PruebasUnitarias.csproj (../../CALYPSO/Calypso_inMT300/PruebasUnitarias/PruebasUnitarias.csproj):12-13.
+• The five-entry parameter dictionary is copied three times (:64-77, :165-178, :234-247) while ConfiguracionBasica (:227-259) exists and is used by only one test; use it (or a builder) everywhere.
+• Hard-coded "20260706" and environment values (MT300-DEV-Input, usrCalypuat, a UAT user name) are committed; use neutral constants.
+• Unused using System.Text;/System.Linq; test names mix Spanish/English patterns; ImplicitUsings/Nullable are enabled on net48 and work only because LangVersion is latest.
+• Package versions (MSTest 4.0.2, Moq 4.20.72) are pinned in the project, unlike the production projects (CMT-FR-19).
+Fix: extract a fixture/builder and shared constants; keep one naming style. Benefit: smaller, easier-to-extend tests. Suggested JIRA: CMT-24 (Minor)
+5. Architecture-Fit Note
+Applying the standing question in section 6 of the control document (./_ORCHESTRATION.md): this service is a timer-driven polling publisher over a table used as an outbox (TB_SRV_SWF_TRABAJO rows of type MT-300, NF_MQ_MSG_ETL IS NULL -> EXITOSO) that hands each row to an ActiveMQ queue; the work per message is one publish plus one status update. That is already the "message-driven" shape of the trade-off table, and the only reason it is fragile is that the outbox contract is implemented backwards (the read consumes the row, CMT-FR-1) and neither side is atomic. There is nothing multi-step with compensations here, so a workflow/saga engine, serverless function or microservice split would add cost without addressing the defects. The recommended sequence is the portfolio one: (1) make the read non-destructive and the mark verifiable (CMT-FR-1, 2, 3), surface read/send/mark failures (CMT-FR-5, 6, 12, 13), keep payloads out of logs (CMT-FR-14) and make the build reproducible (CMT-FR-19); (2) make the test project compile and cover the failure paths (CMT-FR-22, 23) and extract the shared scaffolding it duplicates (CMT-FR-10); (3) only then decide on hosting: modernise in place (.NET 8 worker, same layering) or replace the table poll with a transactional outbox/CDC publisher. That decision needs facts this audit cannot see: the volume and peak rate of MT300, the real timer interval (held in the encrypted configuration), the latency Calypso expects, whether the Calypso consumer de-duplicates by folio, broker URI options and failover policy, and the hosting constraints. A full rewrite is not recommended from a code-quality review alone.
+6. JIRA-Ready Backlog
+ID	Title	Category	Project	File(s)	Priority
+CMT-1	Make sp_CinMT300_GetOperacionesMT300 a pure read; move the PROC/NF_IMPRESION marks into the confirmation procedure; make @MaxRegistros a real batch size	MustChange/rewrite	Database	001 SP, 002 SP, OperacionServicio.cs	Blocker
+CMT-19	Reference MUFG_T24, NMS and SimpleInjector through an internal package feed instead of D:\ServiceCMS (and align platform configs)	MustChange/rewrite	All four	four .csproj	Blocker
+CMT-2	Isolate malformed messages per row (no negative SUBSTRING), add a transaction/quarantine, size @Mensaje, filter NULL	MustChange/rewrite	Database	001 SP	Major
+CMT-3	Return and use the job row's own date as the update key; THROW when the update touches no row	MustChange/rewrite	Database, Aplicacion	001 SP, 002 SP, OperacionServicio.cs	Major
+CMT-5	Alert per failed send/mark with folio and stack; keep the batch moving; return a real outcome; stop catching cancellation	MustChange/rewrite	Aplicacion	OperacionServicio.cs	Major
+CMT-6	Finalise the tick in a finally; stop reporting a failed read/send as success	MustChange/rewrite	Aplicacion	OperacionServicio.cs	Major
+CMT-12	Throw on !Exito in the TOMI read so SQL failures are visible	MustChange/rewrite	Infraestructura	OperacionesTomiDao.cs	Major
+CMT-13	Release the ActiveMQ connection when the connect fails; make MQServicio disposable	MustChange/rewrite	Infraestructura, Aplicacion	MQServicio.cs, OperacionServicio.cs	Major
+CMT-14	Remove the full MT300 body from the error log	MustChange/rewrite	Infraestructura	MQServicio.cs	Major
+CMT-22	Make the unit tests compile (optional arguments in expression trees, wrong argument type)	MustChange/rewrite	Tests	OperacionServicioUT.cs	Major
+CMT-23	Fix the vacuous test, add failure-path, validator, MQ, DAO and SQL tests	MustChange/rewrite	Tests, Database	new test classes	Major
+CMT-7	Alert once per non-business day, not on every tick	rewrite_recommended	Aplicacion	ValidadorEjecucion.cs, AppLogger.cs	Major
+CMT-4	Procedure hygiene: set-based read, usp_ name, NOT EXISTS, deterministic TOP, dead code	rewrite_recommended	Database	001 SP	Minor
+CMT-15	Guard the nullable PID in the alert adapter	MustChange/rewrite	Infraestructura	AppLogger.cs	Minor
+CMT-8	Check the results of start/stop state writes; pass CancellationToken to every per-tick call	rewrite_recommended	Aplicacion, Host	OperacionServicio.cs, ValidadorEjecucion.cs, ServiceHost.cs	Minor
+CMT-9	Parse the operating window and MaxRegistros strictly; support overnight windows; drop unused required parameters	rewrite_recommended	Aplicacion	ValidadorEjecucion.cs, OperacionServicio.cs, ConstantesServicio.cs	Minor
+CMT-10	Extract the duplicated service scaffolding into the shared library	rewrite_recommended	Aplicacion, Infraestructura, Host	ServiceHost.cs, ValidadorEjecucion.cs, AppLogger.cs, ResultadoValidacionModel.cs	Minor
+CMT-16	One producer per connection, correlation id, exception-safe disconnect, URI timeouts	rewrite_recommended	Infraestructura	MQServicio.cs	Minor
+CMT-17	Declare [CallerMemberName] on IAppLogger	rewrite_recommended	Aplicacion, Infraestructura	IAppLogger.cs, AppLogger.cs	Minor
+CMT-20	Composition-root clean-ups; request the MQ password as a sensitive parameter	rewrite_recommended	Host, Aplicacion	ServiceHost.cs, ConstantesServicio.cs	Minor
+CMT-24	Test fixture/builder and neutral constants	rewrite_recommended	Tests	OperacionServicioUT.cs	Minor
+CMT-11	Remove dead members and fix naming/comments	NiceToRewrite_ifTimePermits	Aplicacion	several	Minor
+CMT-18	Culture-safe, null-safe connection-error mapper; remove unused field; one exception style	NiceToRewrite_ifTimePermits	Infraestructura	MapConnectionError.cs, MQServicio.cs, OperacionesTomiDao.cs	Minor
+CMT-21	One logging facade in the host; remove the dead force flag and commented registration; add README/CI	NiceToRewrite_ifTimePermits	Host	ServiceHost.cs, App.config	Minor
+
+7. Open Questions (facts not in the repository)
+1. Does a tb_srv_swf_plan_trabajo_maestro row with cve_mensaje = 'MT-300' and tipo_operacion = 'SWIFT_IN' exist for every candidate folio, and who else consumes cve_estatus, NF_IMPRESION, NF_MQ_MSG_ETL, NF_HORA_AUTORIZACION and OFS_AUTHOR? This decides how severe CMT-FR-1 and CMT-FR-3 are in production (message loss versus repeated delivery).
+2. What is CALYPSO_MT300_MAX_REGISTROS in each environment today? Was the controlled-test value 5 left in production (CMT-FR-1)?
+3. Is the :30T: trade date normally equal to NF_FECHA_INICIO? Real NF_MQ_MSG samples (line endings, length, presence of :30T:) are needed for CMT-FR-2 and CMT-FR-3.
+4. Does the Calypso consumer de-duplicate by folio or message id, and what is the agreed redelivery/dead-letter policy (CMT-FR-16, GEN-18)?
+5. What are the broker URI and options in CALYPSO_MQ_SERVIDOR (failover, timeouts, async send), and is CALYPSO_MQ_PSW stored encrypted (CMT-FR-13, 16, 20)?
+6. What are the real timer interval and operating window (encrypted configuration and CALYPSO_MQ_HORA_*)? They drive the alert volume in CMT-FR-7 and the exposure window in CMT-FR-9.
+7. Which MUFG_T24.dll build is deployed, and does its IParametrizacion still declare the optional CancellationToken parameters (CMT-FR-22)?
+8. Is [InterfacesT24] the database NombreBasedatos.TOMI resolves to (the procedure header says TOMI)?
